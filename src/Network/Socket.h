@@ -17,7 +17,7 @@
 #include <atomic>
 #include <sstream>
 #include <functional>
-#include "Util/TimeTicker.h"
+#include "Util/SpeedStatistic.h"
 #include "sockutil.h"
 #include "Poller/Timer.h"
 #include "Poller/EventPoller.h"
@@ -181,7 +181,7 @@ public:
         _num = that._num;
         _poller = poller;
         if (_poller == that._poller) {
-            throw std::invalid_argument("copy a SockFD with same poller!");
+            throw std::invalid_argument("Copy a SockFD with same poller");
         }
     }
 
@@ -375,6 +375,12 @@ public:
     virtual ssize_t send(Buffer::Ptr buf, struct sockaddr *addr = nullptr, socklen_t addr_len = 0, bool try_flush = true);
 
     /**
+     * 尝试将所有数据写socket
+     * @return -1代表失败(socket无效或者发送超时)，0代表成功?
+     */
+    int flushAll();
+
+    /**
      * 关闭socket且触发onErr回调，onErr回调将在poller线程中进行
      * @param err 错误原因
      * @return 是否成功触发onErr回调
@@ -425,6 +431,12 @@ public:
     virtual bool cloneFromListenSocket(const Socket &other);
 
     /**
+     * 从源tcp peer socket或udp socket克隆
+     * 目的是为了实现socket切换poller线程
+     */
+    virtual bool cloneFromPeerSocket(const Socket &other);
+
+    /**
      * 绑定udp 目标地址，后续发送时就不用再单独指定了
      * @param dst_addr 目标地址
      * @param addr_len 目标地址长度
@@ -453,6 +465,16 @@ public:
      */
     virtual uint64_t elapsedTimeAfterFlushed();
 
+    /**
+     * 获取接收速率，单位bytes/s
+     */
+    int getRecvSpeed();
+
+    /**
+     * 获取发送速率，单位bytes/s
+     */
+    int getSendSpeed();
+
     ////////////SockInfo override////////////
     std::string get_local_ip() override;
     uint16_t get_local_port() override;
@@ -461,6 +483,7 @@ public:
     std::string getIdentifier() const override;
 
 private:
+    SockFD::Ptr cloneSockFD(const Socket &other);
     SockFD::Ptr setPeerSock(int fd);
     SockFD::Ptr makeSock(int sock, SockNum::SockType type);
     int onAccept(const SockFD::Ptr &sock, int event) noexcept;
@@ -472,7 +495,7 @@ private:
     void stopWriteAbleEvent(const SockFD::Ptr &sock);
     bool listen(const SockFD::Ptr &sock);
     bool flushData(const SockFD::Ptr &sock, bool poller_thread);
-    bool attachEvent(const SockFD::Ptr &sock, bool is_udp = false);
+    bool attachEvent(const SockFD::Ptr &sock);
     ssize_t send_l(Buffer::Ptr buf, bool is_buf_sock, bool try_flush = true);
     void connect_l(const std::string &url, uint16_t port, const onErrCB &con_cb_in, float timeout_sec, const std::string &local_ip, uint16_t local_port);
 
@@ -527,6 +550,13 @@ private:
     BufferList::SendResult _send_result;
     //对象个数统计
     ObjectStatistic<Socket> _statistic;
+
+    //是否启用网速统计
+    bool _enable_speed = false;
+    //接收速率统计
+    BytesSpeed _recv_speed;
+    //发送速率统计
+    BytesSpeed _send_speed;
 };
 
 class SockSender {
@@ -560,7 +590,7 @@ public:
 class SocketHelper : public SockSender, public SockInfo, public TaskExecutorInterface {
 public:
     SocketHelper(const Socket::Ptr &sock);
-    ~SocketHelper() override;
+    ~SocketHelper() override = default;
 
     ///////////////////// Socket util std::functions /////////////////////
     /**
@@ -596,6 +626,17 @@ public:
      */
     Socket::Ptr createSocket();
 
+    /**
+     * 获取socket对象
+     */
+    const Socket::Ptr &getSock() const;
+
+    /**
+     * 尝试将所有数据写socket
+     * @return -1代表失败(socket无效或者发送超时)，0代表成功?
+     */
+    int flushAll();
+
     ///////////////////// SockInfo override /////////////////////
     std::string get_local_ip() override;
     uint16_t get_local_port() override;
@@ -625,7 +666,6 @@ public:
 protected:
     void setPoller(const EventPoller::Ptr &poller);
     void setSock(const Socket::Ptr &sock);
-    const Socket::Ptr& getSock() const;
 
 private:
     bool _try_flush = true;

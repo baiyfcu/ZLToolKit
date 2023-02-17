@@ -65,10 +65,13 @@ Socket::Socket(const EventPoller::Ptr &poller, bool enable_mutex) :
     setOnAccept(nullptr);
     setOnFlush(nullptr);
     setOnBeforeAccept(nullptr);
+    setOnSendResult(nullptr);
 }
 
 Socket::~Socket() {
     closeSock();
+    //未发送完毕的数据主动触发onSendResult回调，防止_send_result可能先析构再触发回调时崩溃
+    _send_buf_sending.clear();
 }
 
 void Socket::setOnRead(onReadCB cb) {
@@ -77,7 +80,7 @@ void Socket::setOnRead(onReadCB cb) {
         _on_read = std::move(cb);
     } else {
         _on_read = [](const Buffer::Ptr &buf, struct sockaddr *, int) {
-            WarnL << "Socket not set read callback, data ignored:" << buf->size();
+            WarnL << "Socket not set read callback, data ignored: " << buf->size();
         };
     }
 }
@@ -88,7 +91,7 @@ void Socket::setOnErr(onErrCB cb) {
         _on_err = std::move(cb);
     } else {
         _on_err = [](const SockException &err) {
-            WarnL << "Socket not set err callback, err:" << err.what();
+            WarnL << "Socket not set err callback, err: " << err.what();
         };
     }
 }
@@ -99,7 +102,7 @@ void Socket::setOnAccept(onAcceptCB cb) {
         _on_accept = std::move(cb);
     } else {
         _on_accept = [](Socket::Ptr &sock, shared_ptr<void> &complete) {
-            WarnL << "Socket not set accept callback, peer fd:" << sock->rawFD();
+            WarnL << "Socket not set accept callback, peer fd: " << sock->rawFD();
         };
     }
 }
@@ -192,7 +195,7 @@ void Socket::connect_l(const string &url, uint16_t port, const onErrCB &con_cb_i
 
         //保存fd
         LOCK_GUARD(strong_self->_mtx_sock_fd);
-        strong_self->_sock_fd = sock_fd;
+        strong_self->_sock_fd = std::move(sock_fd);
     });
 
     if (isIP(url.data())) {
@@ -232,7 +235,7 @@ void Socket::onConnected(const SockFD::Ptr &sock, const onErrCB &cb) {
 
     //先删除之前的可写事件监听
     _poller->delEvent(sock->rawFd());
-    if (!attachEvent(sock, false)) {
+    if (!attachEvent(sock)) {
         //连接失败
         cb(SockException(Err_other, "add event to poller failed when connected"));
         return;
@@ -243,12 +246,13 @@ void Socket::onConnected(const SockFD::Ptr &sock, const onErrCB &cb) {
     cb(err);
 }
 
-bool Socket::attachEvent(const SockFD::Ptr &sock, bool is_udp) {
+bool Socket::attachEvent(const SockFD::Ptr &sock) {
     weak_ptr<Socket> weak_self = shared_from_this();
     weak_ptr<SockFD> weak_sock = sock;
     _enable_recv = true;
     _read_buffer = _poller->getSharedBuffer();
-    int result = _poller->addEvent(sock->rawFd(), EventPoller::Event_Read | EventPoller::Event_Error | EventPoller::Event_Write, [weak_self,weak_sock,is_udp](int event) {
+    auto is_udp = sock->type() == SockNum::Sock_UDP;
+    int result = _poller->addEvent(sock->rawFd(), EventPoller::Event_Read | EventPoller::Event_Error | EventPoller::Event_Write, [weak_self, weak_sock, is_udp](int event) {
         auto strong_self = weak_self.lock();
         auto strong_sock = weak_sock.lock();
         if (!strong_self || !strong_sock) {
@@ -289,7 +293,7 @@ ssize_t Socket::onRead(const SockFD::Ptr &sock, bool is_udp) noexcept{
             if (!is_udp) {
                 emitErr(SockException(Err_eof, "end of file"));
             } else {
-                WarnL << "recv eof on udp socket[" << sock_fd << "]";
+                WarnL << "Recv eof on udp socket[" << sock_fd << "]";
             }
             return ret;
         }
@@ -300,10 +304,15 @@ ssize_t Socket::onRead(const SockFD::Ptr &sock, bool is_udp) noexcept{
                 if (!is_udp) {
                     emitErr(toSockException(err));
                 } else {
-                    WarnL << "recv err on udp socket[" << sock_fd << "]:" << uv_strerror(err);
+                    WarnL << "Recv err on udp socket[" << sock_fd << "]: " << uv_strerror(err);
                 }
             }
             return ret;
+        }
+
+        if (_enable_speed) {
+            // 更新接收速率
+            _recv_speed += nread;
         }
 
         ret += nread;
@@ -317,7 +326,7 @@ ssize_t Socket::onRead(const SockFD::Ptr &sock, bool is_udp) noexcept{
             //此处捕获异常，目的是防止数据未读尽，epoll边沿触发失效的问题
             _on_read(_read_buffer, (struct sockaddr *)&addr, len);
         } catch (std::exception &ex) {
-            ErrorL << "触发socket on_read事件时,捕获到异常:" << ex.what();
+            ErrorL << "Exception occurred when emit on_read: " << ex.what();
         }
     }
     return 0;
@@ -332,8 +341,8 @@ bool Socket::emitErr(const SockException& err) noexcept{
         }
     }
 
+    //先关闭socket，再触发on_err事件，防止死循环：https://github.com/ZLMediaKit/ZLMediaKit/issues/2121
     closeSock();
-
     weak_ptr<Socket> weak_self = shared_from_this();
     _poller->async([weak_self, err]() {
         auto strong_self = weak_self.lock();
@@ -344,10 +353,9 @@ bool Socket::emitErr(const SockException& err) noexcept{
         try {
             strong_self->_on_err(err);
         } catch (std::exception &ex) {
-            ErrorL << "触发socket on_err事件时,捕获到异常:" << ex.what();
+            ErrorL << "Exception occurred when emit on_err: " << ex.what();
         }
     });
-
     return true;
 }
 
@@ -380,37 +388,39 @@ ssize_t Socket::send_l(Buffer::Ptr buf, bool is_buf_sock, bool try_flush) {
         return 0;
     }
 
-    SockFD::Ptr sock;
-    {
-        LOCK_GUARD(_mtx_sock_fd);
-        sock = _sock_fd;
-    }
-
-    if (!sock) {
-        //如果已断开连接或者发送超时
-        return -1;
-    }
-
     {
         LOCK_GUARD(_mtx_send_buf_waiting);
         _send_buf_waiting.emplace_back(std::move(buf), is_buf_sock);
     }
 
-    if(try_flush){
-        if (_sendable) {
-            //该socket可写
-            return flushData(sock, false) ? size : -1;
-        }
-
-        //该socket不可写,判断发送超时
-        if (_send_flush_ticker.elapsedTime() > _max_send_buffer_ms) {
-            //如果发送列队中最老的数据距今超过超时时间限制，那么就断开socket连接
-            emitErr(SockException(Err_other, "socket send timeout"));
+    if (try_flush) {
+        if (flushAll()) {
             return -1;
         }
     }
 
     return size;
+}
+
+int Socket::flushAll() {
+    LOCK_GUARD(_mtx_sock_fd);
+
+    if (!_sock_fd) {
+        //如果已断开连接或者发送超时
+        return -1;
+    }
+    if (_sendable) {
+        //该socket可写
+        return flushData(_sock_fd, false) ? 0 : -1;
+    }
+
+    //该socket不可写,判断发送超时
+    if (_send_flush_ticker.elapsedTime() > _max_send_buffer_ms) {
+        //如果发送列队中最老的数据距今超过超时时间限制，那么就断开socket连接
+        emitErr(SockException(Err_other, "socket send timeout"));
+        return -1;
+    }
+    return 0;
 }
 
 void Socket::onFlushed(const SockFD::Ptr &pSock) {
@@ -452,6 +462,16 @@ uint64_t Socket::elapsedTimeAfterFlushed(){
     return _send_flush_ticker.elapsedTime();
 }
 
+int Socket::getRecvSpeed() {
+    _enable_speed = true;
+    return _recv_speed.getSpeed();
+}
+
+int Socket::getSendSpeed() {
+    _enable_speed = true;
+    return _send_speed.getSpeed();
+}
+
 bool Socket::listen(const SockFD::Ptr &sock){
     closeSock();
     weak_ptr<SockFD> weak_sock = sock;
@@ -490,11 +510,11 @@ bool Socket::bindUdpSock(uint16_t port, const string &local_ip, bool enable_reus
         return false;
     }
     auto sock = makeSock(fd, SockNum::Sock_UDP);
-    if (!attachEvent(sock, true)) {
+    if (!attachEvent(sock)) {
         return false;
     }
     LOCK_GUARD(_mtx_sock_fd);
-    _sock_fd = sock;
+    _sock_fd = std::move(sock);
     return true;
 }
 
@@ -514,7 +534,7 @@ int Socket::onAccept(const SockFD::Ptr &sock, int event) noexcept {
                 }
                 auto ex = toSockException(err);
                 emitErr(ex);
-                ErrorL << "tcp服务器监听异常:" << ex.what();
+                ErrorL << "Accept socket failed: " << ex.what();
                 return -1;
             }
 
@@ -533,7 +553,7 @@ int Socket::onAccept(const SockFD::Ptr &sock, int event) noexcept {
                 //拦截Socket对象的构造
                 peer_sock = _on_before_accept(_poller);
             } catch (std::exception &ex) {
-                ErrorL << "触发socket before accept事件时,捕获到异常:" << ex.what();
+                ErrorL << "Exception occurred when emit on_before_accept: " << ex.what();
                 close(fd);
                 continue;
             }
@@ -549,12 +569,12 @@ int Socket::onAccept(const SockFD::Ptr &sock, int event) noexcept {
             shared_ptr<void> completed(nullptr, [peer_sock, peer_sock_fd](void *) {
                 try {
                     //然后把该fd加入poll监听(确保先触发onAccept事件然后再触发onRead等事件)
-                    if (!peer_sock->attachEvent(peer_sock_fd, false)) {
+                    if (!peer_sock->attachEvent(peer_sock_fd)) {
                         //加入poll监听失败，触发onErr事件，通知该Socket无效
                         peer_sock->emitErr(SockException(Err_eof, "add event to poller failed when accept a socket"));
                     }
                 } catch (std::exception &ex) {
-                    ErrorL << ex.what();
+                    ErrorL << "Exception occurred: "<< ex.what();
                 }
             });
 
@@ -564,7 +584,7 @@ int Socket::onAccept(const SockFD::Ptr &sock, int event) noexcept {
                 //先触发onAccept事件，此时应该监听该Socket的onRead等事件
                 _on_accept(peer_sock, completed);
             } catch (std::exception &ex) {
-                ErrorL << "触发socket accept事件时,捕获到异常:" << ex.what();
+                ErrorL << "Exception occurred when emit on_accept: " << ex.what();
                 continue;
             }
         }
@@ -572,7 +592,7 @@ int Socket::onAccept(const SockFD::Ptr &sock, int event) noexcept {
         if (event & EventPoller::Event_Error) {
             auto ex = getSockErr(sock);
             emitErr(ex);
-            ErrorL << "tcp服务器监听异常:" << ex.what();
+            ErrorL << "TCP listener occurred a err: " << ex.what();
             return -1;
         }
     }
@@ -619,7 +639,7 @@ uint16_t Socket::get_peer_port() {
 }
 
 string Socket::getIdentifier() const{
-    static string class_name = "Socket:";
+    static string class_name = "Socket: ";
     return class_name + to_string(reinterpret_cast<uint64_t>(this));
 }
 
@@ -642,7 +662,17 @@ bool Socket::flushData(const SockFD::Ptr &sock, bool poller_thread) {
                 if (!_send_buf_waiting.empty()) {
                     //把一级缓中数数据放置到二级缓存中并清空
                     LOCK_GUARD(_mtx_event);
-                    send_buf_sending_tmp.emplace_back(BufferList::create(std::move(_send_buf_waiting), _send_result, sock->type() == SockNum::Sock_UDP));
+                    auto send_result = _enable_speed ? [this](const Buffer::Ptr &buffer, bool send_success) {
+                        if (send_success) {
+                            //更新发送速率
+                            _send_speed += buffer->size();
+                        }
+                        LOCK_GUARD(_mtx_event);
+                        if (_send_result) {
+                            _send_result(buffer, send_success);
+                        }
+                    } : _send_result;
+                    send_buf_sending_tmp.emplace_back(BufferList::create(std::move(_send_buf_waiting), std::move(send_result), sock->type() == SockNum::Sock_UDP));
                     break;
                 }
             }
@@ -692,7 +722,7 @@ bool Socket::flushData(const SockFD::Ptr &sock, bool poller_thread) {
         if (is_udp) {
             // udp发送异常，把数据丢弃
             send_buf_sending_tmp.pop_front();
-            WarnL << "send udp socket[" << fd << "] failed, data ignored:" << uv_strerror(err);
+            WarnL << "Send udp socket[" << fd << "] failed, data ignored: " << uv_strerror(err);
             continue;
         }
         // tcp发送失败时，触发异常
@@ -794,17 +824,38 @@ const EventPoller::Ptr &Socket::getPoller() const{
     return _poller;
 }
 
-bool Socket::cloneFromListenSocket(const Socket &other){
+SockFD::Ptr Socket::cloneSockFD(const Socket &other) {
     SockFD::Ptr sock;
     {
         LOCK_GUARD(other._mtx_sock_fd);
         if (!other._sock_fd) {
-            WarnL << "sockfd of src socket is null!";
-            return false;
+            WarnL << "sockfd of src socket is null";
+            return nullptr;
         }
         sock = std::make_shared<SockFD>(*(other._sock_fd), _poller);
     }
+    return sock;
+}
+
+bool Socket::cloneFromListenSocket(const Socket &other) {
+    auto sock = cloneSockFD(other);
+    if (!sock) {
+        return false;
+    }
     return listen(sock);
+}
+
+bool Socket::cloneFromPeerSocket(const Socket &other) {
+    auto sock = cloneSockFD(other);
+    if (!sock) {
+        return false;
+    }
+    if (!attachEvent(sock)) {
+        return false;
+    }
+    LOCK_GUARD(_mtx_sock_fd);
+    _sock_fd = std::move(sock);
+    return true;
 }
 
 bool Socket::bindPeerAddr(const struct sockaddr *dst_addr, socklen_t addr_len) {
@@ -816,7 +867,7 @@ bool Socket::bindPeerAddr(const struct sockaddr *dst_addr, socklen_t addr_len) {
         return false;
     }
     if (-1 == ::connect(_sock_fd->rawFd(), dst_addr, addr_len ? addr_len : SockUtil::get_sock_len(dst_addr))) {
-        WarnL << "connect peer address failed:" << SockUtil::inet_ntoa(dst_addr);
+        WarnL << "Connect socket to peer address failed: " << SockUtil::inet_ntoa(dst_addr);
         return false;
     }
     return true;
@@ -860,8 +911,6 @@ SocketHelper::SocketHelper(const Socket::Ptr &sock) {
     setOnCreateSocket(nullptr);
 }
 
-SocketHelper::~SocketHelper() {}
-
 void SocketHelper::setPoller(const EventPoller::Ptr &poller){
     _poller = poller;
 }
@@ -884,6 +933,13 @@ const EventPoller::Ptr& SocketHelper::getPoller() const {
 
 const Socket::Ptr& SocketHelper::getSock() const{
     return _sock;
+}
+
+int SocketHelper::flushAll() {
+    if (!_sock) {
+        return -1;
+    }
+    return _sock->flushAll();
 }
 
 ssize_t SocketHelper::send(Buffer::Ptr buf) {

@@ -237,16 +237,16 @@ std::string trim(std::string &&s, const string &chars) {
     return std::move(s);
 }
 
-void replace(string &str, const string &old_str, const string &new_str) {
+void replace(string &str, const string &old_str, const string &new_str,std::string::size_type b_pos) {
     if (old_str.empty() || old_str == new_str) {
         return;
     }
-    auto pos = str.find(old_str);
+    auto pos = str.find(old_str,b_pos);
     if (pos == string::npos) {
         return;
     }
     str.replace(pos, old_str.size(), new_str);
-    replace(str, old_str, new_str);
+    replace(str, old_str, new_str,pos + new_str.length());
 }
 
 bool start_with(const string &str, const string &substr) {
@@ -363,7 +363,7 @@ static atomic<uint64_t> s_currentMillisecond_system(getCurrentMicrosecondOrigin(
 static inline bool initMillisecondThread() {
     static std::thread s_thread([]() {
         setThreadName("stamp thread");
-        DebugL << "Stamp thread started!";
+        DebugL << "Stamp thread started";
         uint64_t last = getCurrentMicrosecondOrigin();
         uint64_t now;
         uint64_t microsecond = 0;
@@ -382,7 +382,7 @@ static inline bool initMillisecondThread() {
                 s_currentMicrosecond.store(microsecond, memory_order_release);
                 s_currentMillisecond.store(microsecond / 1000, memory_order_release);
             } else if (expired != 0) {
-                WarnL << "Stamp expired is abnormal:" << expired;
+                WarnL << "Stamp expired is abnormal: " << expired;
             }
             //休眠0.5 ms
             usleep(500);
@@ -415,9 +415,17 @@ string getTimeStr(const char *fmt, time_t time) {
         time = ::time(nullptr);
     }
     auto tm = getLocalTime(time);
-    char buffer[64];
-    auto success = std::strftime(buffer, sizeof(buffer), fmt, &tm);
-    return 0 == success ? string(fmt) : buffer;
+    size_t size = strlen(fmt) + 64;
+    string ret;
+    ret.resize(size);
+    size = std::strftime(&ret[0], size, fmt, &tm);
+    if (size > 0) {
+        ret.resize(size);
+    }
+    else{
+        ret = fmt;
+    }
+    return ret;
 }
 
 
@@ -560,7 +568,7 @@ bool setThreadAffinity(int i) {
     if (!pthread_setaffinity_np(pthread_self(), sizeof(mask), &mask)) {
         return true;
     }
-    WarnL << "pthread_setaffinity_np failed:" << get_uv_errmsg();
+    WarnL << "pthread_setaffinity_np failed: " << get_uv_errmsg();
 #endif
     return false;
 }
@@ -629,6 +637,11 @@ string getEnv(const string &key) {
     }
     auto value = *ekey ? getenv(ekey) : nullptr;
     return value ? value : "";
+}
+
+
+void Creator::onDestoryException(const type_info &info, const exception &ex) {
+    ErrorL << "Invoke " << demangle(info.name()) << "::onDestory throw a exception: " << ex.what();
 }
 
 }  // namespace toolkit
