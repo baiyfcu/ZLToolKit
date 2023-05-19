@@ -73,7 +73,7 @@ void setLogger(Logger *logger) {
 
 ///////////////////Logger///////////////////
 
-INSTANCE_IMP(Logger, exeName())
+INSTANCE_IMP(Logger, exeName(false))
 
 Logger::Logger(const string &loggerName) {
     _logger_name = loggerName;
@@ -374,7 +374,7 @@ void LogChannel::format(const Logger &logger, ostream &ost, const LogContextPtr 
 
     if (enable_detail) {
         // tag or process name
-        ost << "[" << (!ctx->_flag.empty() ? ctx->_flag : logger.getName()) << "] ";
+        ost << "[" << (!ctx->_flag.empty() ? ctx->_flag : ctx->_module_name) << "] ";
         // pid and thread_name
         ost << "[" << printf_pid() << "-" << ctx->_thread_name << "] ";
         // source file location
