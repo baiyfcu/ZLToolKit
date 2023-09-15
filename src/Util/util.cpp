@@ -415,6 +415,8 @@ string getTimeStr(const char *fmt, time_t time) {
         time = ::time(nullptr);
     }
     auto tm = getLocalTime(time);
+    if (tm.tm_year == -1 || tm.tm_mon == -1)
+        return fmt;
     size_t size = strlen(fmt) + 64;
     string ret;
     ret.resize(size);
