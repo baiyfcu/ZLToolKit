@@ -166,16 +166,19 @@ void Socket::connect_l(const string &url, uint16_t port, const onErrCB &con_cb_i
             return;
         }
 
-        strong_self->setPeerSock(sock, SockNum::Sock_TCP);
         // 监听该socket是否可写，可写表明已经连接服务器成功
         int result = strong_self->_poller->addEvent(sock, EventPoller::Event_Write, [weak_self, sock, con_cb](int event) {
             if (auto strong_self = weak_self.lock()) {
-                // socket可写事件，说明已经连接服务器成功
+                 // socket可写事件，说明已经连接服务器成功
+                strong_self->setSock(strong_self->makeSock(sock, SockNum::Sock_TCP));
                 strong_self->onConnected(sock, con_cb);
+            } else {
+                CLOSE_SOCK(sock);
             }
         });
 
         if (result == -1) {
+            CLOSE_SOCK(sock);
             con_cb(SockException(Err_other, "add event to poller failed when start connect"));
         }
     });
@@ -234,8 +237,19 @@ void Socket::onConnected(int sock, const onErrCB &cb) {
 
 bool Socket::attachEvent(int sock, SockNum::SockType type) {
     weak_ptr<Socket> weak_self = shared_from_this();
+    if (type == SockNum::Sock_TCP_Server) {
+        // tcp服务器
+        auto result = _poller->addEvent(sock, EventPoller::Event_Read | EventPoller::Event_Error, [weak_self, sock](int event) {
+            if (auto strong_self = weak_self.lock()) {
+                strong_self->onAccept(sock, event);
+            }
+        });
+        return -1 != result;
+    }
+
+    // tcp客户端或udp
     auto read_buffer = _poller->getSharedBuffer();
-    int result = _poller->addEvent(sock, EventPoller::Event_Read | EventPoller::Event_Error | EventPoller::Event_Write, [weak_self, sock, type, read_buffer](int event) {
+    auto result = _poller->addEvent(sock, EventPoller::Event_Read | EventPoller::Event_Error | EventPoller::Event_Write, [weak_self, sock, type, read_buffer](int event) {
         auto strong_self = weak_self.lock();
         if (!strong_self) {
             return;
@@ -353,7 +367,12 @@ ssize_t Socket::send(string buf, struct sockaddr *addr, socklen_t addr_len, bool
 
 ssize_t Socket::send(Buffer::Ptr buf, struct sockaddr *addr, socklen_t addr_len, bool try_flush) {
     if (!addr) {
-        return send_l(std::move(buf), false, try_flush);
+        if (!_udp_send_dst) {
+            return send_l(std::move(buf), false, try_flush);
+        }
+        // 本次发送未指定目标地址，但是目标定制已通过bindPeerAddr指定
+        addr = (struct sockaddr *)_udp_send_dst.get();
+        addr_len = SockUtil::get_sock_len(addr);
     }
     return send_l(std::make_shared<BufferSock>(std::move(buf), addr, addr_len), true, try_flush);
 }
@@ -467,31 +486,13 @@ int Socket::getSendSpeed() {
     return _send_speed.getSpeed();
 }
 
-bool Socket::listen(const SockFD::Ptr &sock) {
-    weak_ptr<Socket> weak_self = shared_from_this();
-    int fd = sock->rawFd();
-    int result = _poller->addEvent(fd, EventPoller::Event_Read | EventPoller::Event_Error, [weak_self, fd](int event) {
-        if (auto strong_self = weak_self.lock()) {
-            strong_self->onAccept(fd, event);
-        }
-    });
-
-    if (result == -1) {
-        return false;
-    }
-
-    LOCK_GUARD(_mtx_sock_fd);
-    _sock_fd = sock;
-    return true;
-}
-
 bool Socket::listen(uint16_t port, const string &local_ip, int backlog) {
     closeSock();
-    int sock = SockUtil::listen(port, local_ip.data(), backlog);
-    if (sock == -1) {
+    int fd = SockUtil::listen(port, local_ip.data(), backlog);
+    if (fd == -1) {
         return false;
     }
-    return fromSock_l(sock, SockNum::Sock_TCP_Server);
+    return fromSock_l(makeSock(fd, SockNum::Sock_TCP_Server));
 }
 
 bool Socket::bindUdpSock(uint16_t port, const string &local_ip, bool enable_reuse) {
@@ -500,7 +501,7 @@ bool Socket::bindUdpSock(uint16_t port, const string &local_ip, bool enable_reus
     if (fd == -1) {
         return false;
     }
-    return fromSock_l(fd, SockNum::Sock_UDP);
+    return fromSock_l(makeSock(fd, SockNum::Sock_UDP));
 }
 
 bool Socket::fromSock(int fd, SockNum::SockType type) {
@@ -508,30 +509,25 @@ bool Socket::fromSock(int fd, SockNum::SockType type) {
     SockUtil::setNoSigpipe(fd);
     SockUtil::setNoBlocked(fd);
     SockUtil::setCloExec(fd);
-    return fromSock_l(fd, type);
+    return fromSock_l(makeSock(fd, type));
 }
 
-bool Socket::fromSock_l(int fd, SockNum::SockType type) {
-    switch (type) {
-        case SockNum::Sock_TCP:
-        case SockNum::Sock_UDP: {
-            if (!attachEvent(fd, type)) {
-                return false;
-            }
-            setPeerSock(fd, type);
-            return true;
-        }
-        case SockNum::Sock_TCP_Server: return listen(makeSock(fd, SockNum::Sock_TCP_Server));
-        default: return false;
+bool Socket::fromSock_l(SockFD::Ptr fd) {
+    if (!attachEvent(fd->rawFd(), fd->type())) {
+        return false;
     }
+    setSock(std::move(fd));
+    return true;
 }
 
 int Socket::onAccept(int sock, int event) noexcept {
     int fd;
+    struct sockaddr_storage peer_addr;
+    socklen_t addr_len = sizeof(peer_addr);
     while (true) {
         if (event & EventPoller::Event_Read) {
             do {
-                fd = (int)accept(sock, nullptr, nullptr);
+                fd = (int)accept(sock, (struct sockaddr *)&peer_addr, &addr_len);
             } while (-1 == fd && UV_EINTR == get_uv_error(true));
 
             if (fd == -1) {
@@ -572,7 +568,10 @@ int Socket::onAccept(int sock, int event) noexcept {
             }
 
             // 设置好fd,以备在onAccept事件中可以正常访问该fd
-            peer_sock->setPeerSock(fd, SockNum::Sock_TCP);
+            peer_sock->setSock(peer_sock->makeSock(fd, SockNum::Sock_TCP));
+            // 赋值peer ip，防止在执行setSock时，fd已经被reset断开
+            memcpy(&peer_sock->_peer_addr, &peer_addr, addr_len);
+
             shared_ptr<void> completed(nullptr, [peer_sock, fd](void *) {
                 try {
                     // 然后把该fd加入poll监听(确保先触发onAccept事件然后再触发onRead等事件)
@@ -605,9 +604,12 @@ int Socket::onAccept(int sock, int event) noexcept {
     }
 }
 
-void Socket::setPeerSock(int fd, SockNum::SockType type) {
+void Socket::setSock(SockFD::Ptr fd) {
     LOCK_GUARD(_mtx_sock_fd);
-    _sock_fd = makeSock(fd, type);
+    _sock_fd = std::move(fd);
+    assert(_poller == _sock_fd->getPoller());
+    SockUtil::get_sock_local_addr(_sock_fd->rawFd(), _local_addr);
+    SockUtil::get_sock_peer_addr(_sock_fd->rawFd(), _peer_addr);
 }
 
 string Socket::get_local_ip() {
@@ -615,7 +617,7 @@ string Socket::get_local_ip() {
     if (!_sock_fd) {
         return "";
     }
-    return SockUtil::get_local_ip(_sock_fd->rawFd());
+    return SockUtil::inet_ntoa((struct sockaddr *)&_local_addr);
 }
 
 uint16_t Socket::get_local_port() {
@@ -623,7 +625,7 @@ uint16_t Socket::get_local_port() {
     if (!_sock_fd) {
         return 0;
     }
-    return SockUtil::get_local_port(_sock_fd->rawFd());
+    return SockUtil::inet_port((struct sockaddr *)&_local_addr);
 }
 
 string Socket::get_peer_ip() {
@@ -631,7 +633,10 @@ string Socket::get_peer_ip() {
     if (!_sock_fd) {
         return "";
     }
-    return SockUtil::get_peer_ip(_sock_fd->rawFd());
+    if (_udp_send_dst) {
+        return SockUtil::inet_ntoa((struct sockaddr *)_udp_send_dst.get());
+    }
+    return SockUtil::inet_ntoa((struct sockaddr *)&_peer_addr);
 }
 
 uint16_t Socket::get_peer_port() {
@@ -639,7 +644,10 @@ uint16_t Socket::get_peer_port() {
     if (!_sock_fd) {
         return 0;
     }
-    return SockUtil::get_peer_port(_sock_fd->rawFd());
+    if (_udp_send_dst) {
+        return SockUtil::inet_port((struct sockaddr *)_udp_send_dst.get());
+    }
+    return SockUtil::inet_port((struct sockaddr *)&_peer_addr);
 }
 
 string Socket::getIdentifier() const {
@@ -850,21 +858,10 @@ bool Socket::cloneSocket(const Socket &other) {
     if (!sock) {
         return false;
     }
-    if (sock->type() == SockNum::Sock_TCP_Server) {
-        // tcp监听
-        return listen(sock);
-    }
-
-    // peer tcp或udp socket
-    if (!attachEvent(sock->rawFd(), sock->type())) {
-        return false;
-    }
-    LOCK_GUARD(_mtx_sock_fd);
-    _sock_fd = std::move(sock);
-    return true;
+    return fromSock_l(std::move(sock));
 }
 
-bool Socket::bindPeerAddr(const struct sockaddr *dst_addr, socklen_t addr_len) {
+bool Socket::bindPeerAddr(const struct sockaddr *dst_addr, socklen_t addr_len, bool soft_bind) {
     LOCK_GUARD(_mtx_sock_fd);
     if (!_sock_fd) {
         return false;
@@ -872,9 +869,19 @@ bool Socket::bindPeerAddr(const struct sockaddr *dst_addr, socklen_t addr_len) {
     if (_sock_fd->type() != SockNum::Sock_UDP) {
         return false;
     }
-    if (-1 == ::connect(_sock_fd->rawFd(), dst_addr, addr_len ? addr_len : SockUtil::get_sock_len(dst_addr))) {
-        WarnL << "Connect socket to peer address failed: " << SockUtil::inet_ntoa(dst_addr);
-        return false;
+    addr_len = addr_len ? addr_len : SockUtil::get_sock_len(dst_addr);
+    if (soft_bind) {
+        // 软绑定，只保存地址
+        _udp_send_dst = std::make_shared<struct sockaddr_storage>();
+        memcpy(_udp_send_dst.get(), dst_addr, addr_len);
+    } else {
+        // 硬绑定后，取消软绑定，防止memcpy目标地址的性能损失
+        _udp_send_dst = nullptr;
+        if (-1 == ::connect(_sock_fd->rawFd(), dst_addr, addr_len)) {
+            WarnL << "Connect socket to peer address failed: " << SockUtil::inet_ntoa(dst_addr);
+            return false;
+        }
+        memcpy(&_peer_addr, dst_addr, addr_len);
     }
     return true;
 }

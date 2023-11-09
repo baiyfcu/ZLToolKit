@@ -126,7 +126,11 @@ public:
         unsetSocketOfIOS(_fd);
 #endif //OS_IPHONE
         // 停止socket收发能力
+        #if defined(_WIN32)
+        ::shutdown(_fd, SD_BOTH);
+        #else
         ::shutdown(_fd, SHUT_RDWR);
+        #endif
         close(_fd);
     }
 
@@ -208,6 +212,10 @@ public:
 
     SockNum::SockType type() {
         return _num->type();
+    }
+
+    const EventPoller::Ptr& getPoller() const {
+        return _poller;
     }
 
 private:
@@ -454,9 +462,10 @@ public:
      * 绑定udp 目标地址，后续发送时就不用再单独指定了
      * @param dst_addr 目标地址
      * @param addr_len 目标地址长度
+     * @param soft_bind 是否软绑定，软绑定时不调用udp connect接口，只保存目标地址信息，发送时再传递到sendto函数
      * @return 是否成功
      */
-    bool bindPeerAddr(const struct sockaddr *dst_addr, socklen_t addr_len = 0);
+    bool bindPeerAddr(const struct sockaddr *dst_addr, socklen_t addr_len = 0, bool soft_bind = false);
 
     /**
      * 设置发送flags
@@ -500,7 +509,7 @@ public:
 private:
     SockFD::Ptr cloneSockFD(const Socket &other);
     SockFD::Ptr makeSock(int sock, SockNum::SockType type);
-    void setPeerSock(int fd, SockNum::SockType type);
+    void setSock(SockFD::Ptr fd);
     int onAccept(int sock, int event) noexcept;
     ssize_t onRead(int sock, SockNum::SockType type, const BufferRaw::Ptr &buffer) noexcept;
     void onWriteAble(int sock, SockNum::SockType type);
@@ -508,12 +517,11 @@ private:
     void onFlushed();
     void startWriteAbleEvent(int sock);
     void stopWriteAbleEvent(int sock);
-    bool listen(const SockFD::Ptr &sock);
     bool flushData(int sock, SockNum::SockType type, bool poller_thread);
     bool attachEvent(int sock, SockNum::SockType type);
     ssize_t send_l(Buffer::Ptr buf, bool is_buf_sock, bool try_flush = true);
     void connect_l(const std::string &url, uint16_t port, const onErrCB &con_cb_in, float timeout_sec, const std::string &local_ip, uint16_t local_port);
-    bool fromSock_l(int fd, SockNum::SockType type);
+    bool fromSock_l(SockFD::Ptr sock);
 
 private:
     //send socket时的flag
@@ -528,6 +536,9 @@ private:
     bool _err_emit = false;
     //是否启用网速统计
     bool _enable_speed = false;
+    // udp发送目标地址
+    std::shared_ptr<struct sockaddr_storage> _udp_send_dst;
+
     //接收速率统计
     BytesSpeed _recv_speed;
     //发送速率统计
@@ -572,6 +583,11 @@ private:
     BufferList::SendResult _send_result;
     //对象个数统计
     ObjectStatistic<Socket> _statistic;
+
+    //链接缓存地址,防止tcp reset 导致无法获取对端的地址
+    struct sockaddr_storage _local_addr;
+    struct sockaddr_storage _peer_addr;
+
 };
 
 class SockSender {
