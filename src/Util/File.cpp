@@ -321,6 +321,42 @@ void File::scanDir(const string &path_in, const function<bool(const string &path
     closedir(pDir);
 }
 
+void File::scanDirEx(
+    const string &path_in, const function<bool(const string &path, bool is_dir)> &cb, bool enter_subdirectory, bool all) {
+    string path = path_in;
+    if (path.back() == '/') {
+        path.pop_back();
+    }
+
+    DIR *pDir;
+    dirent *pDirent;
+    if ((pDir = opendir(path.data())) == nullptr) {
+        // 文件夹无效
+        return;
+    }
+    while ((pDirent = readdir(pDir)) != nullptr) {
+        if (is_special_dir(pDirent->d_name)) {
+            continue;
+        }
+        if (!all && pDirent->d_name[0] == '.') {
+            // 隐藏的文件
+            continue;
+        }
+        string strAbsolutePath = path + "/" + pDirent->d_name;
+        bool isDir = is_dir(strAbsolutePath.data());
+        if (!cb(strAbsolutePath, isDir)) {
+            // 不再继续扫描
+            break;
+        }
+
+        if (isDir && enter_subdirectory) {
+            // 如果是文件夹并且扫描子文件夹，那么递归扫描
+            scanDirEx(strAbsolutePath, cb, enter_subdirectory, all);
+        }
+    }
+    closedir(pDir);
+}
+
 uint64_t File::fileSize(FILE *fp, bool remain_size) {
     if (!fp) {
         return 0;

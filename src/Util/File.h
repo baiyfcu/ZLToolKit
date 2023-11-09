@@ -122,6 +122,14 @@ public:
     static void scanDir(const std::string &path, const std::function<bool(const std::string &path, bool isDir)> &cb, bool enter_subdirectory = false);
 
     /**
+     * 遍历文件夹下的所有文件
+     * @param path 文件夹路径
+     * @param cb 回调对象 ，path为绝对路径，isDir为该路径是否为文件夹，返回true代表继续扫描，否则中断
+     * @param enter_subdirectory 是否进入子目录扫描
+     */
+    static void scanDirEx(const std::string &path, const std::function<bool(const std::string &path, bool isDir)> &cb, bool enter_subdirectory = false, bool all = false);
+
+    /**
      * 获取文件大小
      * @param fp 文件句柄
      * @param remain_size true:获取文件剩余未读数据大小，false:获取文件总大小
