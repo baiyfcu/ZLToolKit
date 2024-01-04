@@ -78,6 +78,7 @@ INSTANCE_IMP(Logger, exeName(false))
 Logger::Logger(const string &loggerName) {
     _logger_name = loggerName;
     _last_log = std::make_shared<LogContext>();
+    _default_channel = std::make_shared<ConsoleChannel>("default", LTrace);
 }
 
 Logger::~Logger() {
@@ -124,8 +125,12 @@ void Logger::setLevel(LogLevel level) {
 
 void Logger::writeChannels_l(const LogContextPtr &ctx) {
     _last_str = _str;
-    for (auto &chn : _channels) {
-        chn.second->write(*this, ctx);
+    if (_channels.empty()) {
+        _default_channel->write(*this, ctx);
+    } else {
+        for (auto &chn : _channels) {
+            chn.second->write(*this, ctx);
+        }
     }
     _last_log = ctx;
     _last_log->_repeat = 0;
@@ -438,9 +443,9 @@ bool FileChannelBase::open() {
     _fstream.close();
 #if !defined(_WIN32)
     //创建文件夹
-    File::create_path(_path.data(), S_IRWXO | S_IRWXG | S_IRWXU);
+    File::create_path(_path, S_IRWXO | S_IRWXG | S_IRWXU);
 #else
-    File::create_path(_path.data(),0);
+    File::create_path(_path,0);
 #endif
     _fstream.open(_path.data(), ios::out | ios::app);
     if (!_fstream.is_open()) {
@@ -555,7 +560,7 @@ void FileChannel::clean() {
             break;
         }
         //这个文件距今超过了一定天数，则删除文件
-        File::delete_file(it->data());
+        File::delete_file(*it);
         //删除这条记录
         it = _log_file_map.erase(it);
     }
@@ -568,7 +573,7 @@ void FileChannel::clean() {
             break;
         }
         //删除文件
-        File::delete_file(it->data());
+        File::delete_file(*it);
         //删除这条记录
         _log_file_map.erase(it);
     }
@@ -616,7 +621,7 @@ void LoggerWrapper::printLogV(Logger &logger, int level, const char *file, const
     char *str = nullptr;
     if (vasprintf(&str, fmt, ap) > 0 && str) {
         info << str;
-        free(str);
+        delete [] str; // 开启asan后，用free会卡死
     }
 }
 
