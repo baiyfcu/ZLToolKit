@@ -169,6 +169,7 @@ public:
     void clear();
 
 private:
+    static std::string s_module_name;
     LogContextPtr _ctx;
     Logger &_logger;
 };

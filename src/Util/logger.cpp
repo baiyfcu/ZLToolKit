@@ -191,7 +191,7 @@ LogContext::LogContext(LogLevel level, const char *file, const char *function, i
 
 ///////////////////AsyncLogWriter///////////////////
 
-static string s_module_name = exeName(false);
+string LogContextCapture::s_module_name = exeName(false);
 
 LogContextCapture::LogContextCapture(Logger &logger, LogLevel level, const char *file, const char *function, int line, const char *flag) :
         _ctx(new LogContext(level, file, function, line, s_module_name.c_str(), flag)), _logger(logger) {
