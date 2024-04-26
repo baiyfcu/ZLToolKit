@@ -1,4 +1,4 @@
-﻿/*
+/*
  * Copyright (c) 2016 The ZLToolKit project authors. All Rights Reserved.
  *
  * This file is part of ZLToolKit(https://github.com/ZLMediaKit/ZLToolKit).
@@ -79,6 +79,10 @@ Logger::Logger(const string &loggerName) {
     _logger_name = loggerName;
     _last_log = std::make_shared<LogContext>();
     _default_channel = std::make_shared<ConsoleChannel>("default", LTrace);
+
+#if defined(_WIN32)
+    SetConsoleOutputCP(CP_UTF8);
+#endif
 }
 
 Logger::~Logger() {
@@ -143,7 +147,7 @@ static int64_t timevalDiff(struct timeval &a, struct timeval &b) {
 
 void Logger::writeChannels(const LogContextPtr &ctx) {
     _str = ctx->str();
-    if (ctx->_line == _last_log->_line && ctx->_file == _last_log->_file && _str == _last_str) {
+    if (ctx->_line == _last_log->_line && ctx->_file == _last_log->_file && _str == _last_str&& ctx->_thread_name == _last_log->_thread_name) {
         //重复的日志每隔500ms打印一次，过滤频繁的重复日志
         ++_last_log->_repeat;
         if (timevalDiff(_last_log->_tv, ctx->_tv) > 500) {
@@ -194,7 +198,7 @@ LogContext::LogContext(LogLevel level, const char *file, const char *function, i
 string LogContextCapture::s_module_name = exeName(false);
 
 LogContextCapture::LogContextCapture(Logger &logger, LogLevel level, const char *file, const char *function, int line, const char *flag) :
-        _ctx(new LogContext(level, file, function, line, s_module_name.c_str(), flag)), _logger(logger) {
+        _ctx(new LogContext(level, file, function, line, s_module_name.c_str() ? s_module_name.c_str() : "", flag)), _logger(logger) {
 }
 
 LogContextCapture::LogContextCapture(const LogContextCapture &that) : _ctx(that._ctx), _logger(that._logger) {
@@ -619,9 +623,13 @@ void FileChannel::setFileMaxCount(size_t max_count) {
 void LoggerWrapper::printLogV(Logger &logger, int level, const char *file, const char *function, int line, const char *fmt, va_list ap) {
     LogContextCapture info(logger, (LogLevel) level, file, function, line);
     char *str = nullptr;
-    if (vasprintf(&str, fmt, ap) > 0 && str) {
+    if (vasprintf(&str, fmt, ap) >= 0 && str) {
         info << str;
+#ifdef ASAN_USE_DELETE
         delete [] str; // 开启asan后，用free会卡死
+#else
+        free(str);
+#endif
     }
 }
 

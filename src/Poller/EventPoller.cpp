@@ -39,7 +39,14 @@
                                 | (((epoll_event) & EPOLLOUT) ? Event_Write : 0) \
                                 | (((epoll_event) & EPOLLHUP) ? Event_Error : 0) \
                                 | (((epoll_event) & EPOLLERR) ? Event_Error : 0)
+#define create_event() epoll_create(EPOLL_SIZE)
 #endif //HAS_EPOLL
+
+#if defined(HAS_KQUEUE)
+#include <sys/event.h>
+#define KEVENT_SIZE 1024
+#define create_event() kqueue()
+#endif // HAS_KQUEUE
 
 using namespace std;
 
@@ -60,14 +67,15 @@ void EventPoller::addEventPipe() {
 }
 
 EventPoller::EventPoller(std::string name) {
-    _name = std::move(name);
-#if defined(HAS_EPOLL)
-    _epoll_fd = epoll_create(EPOLL_SIZE);
-    if (_epoll_fd == -1) {
-        throw runtime_error(StrPrinter << "Create epoll fd failed: " << get_uv_errmsg());
+#if defined(HAS_EPOLL) || defined(HAS_KQUEUE)
+    _event_fd = create_event();
+    if (_event_fd == -1) {
+        throw runtime_error(StrPrinter << "Create event fd failed: " << get_uv_errmsg());
     }
-    SockUtil::setCloExec(_epoll_fd);
+    SockUtil::setCloExec(_event_fd);
 #endif //HAS_EPOLL
+
+    _name = std::move(name);
     _logger = Logger::Instance().shared_from_this();
     addEventPipe();
 }
@@ -79,7 +87,7 @@ void EventPoller::shutdown() {
 
     if (_loop_thread) {
         //防止作为子进程时崩溃
-        try { _loop_thread->join(); } catch (...) {}
+        try { _loop_thread->join(); } catch (...) { _loop_thread->detach(); }
         delete _loop_thread;
         _loop_thread = nullptr;
     }
@@ -87,15 +95,17 @@ void EventPoller::shutdown() {
 
 EventPoller::~EventPoller() {
     shutdown();
-#if defined(HAS_EPOLL)
-    if (_epoll_fd != -1) {
-        close(_epoll_fd);
-        _epoll_fd = -1;
+    
+#if defined(HAS_EPOLL) || defined(HAS_KQUEUE)
+    if (_event_fd != -1) {
+        close(_event_fd);
+        _event_fd = -1;
     }
-#endif //defined(HAS_EPOLL)
+#endif
+
     //退出前清理管道中的数据
     onPipeEvent();
-    InfoL << this;
+    InfoL << getThreadName();
 }
 
 int EventPoller::addEvent(int fd, int event, PollEventCB cb) {
@@ -110,25 +120,37 @@ int EventPoller::addEvent(int fd, int event, PollEventCB cb) {
         struct epoll_event ev = {0};
         ev.events = (toEpoll(event)) | EPOLLEXCLUSIVE;
         ev.data.fd = fd;
-        int ret = epoll_ctl(_epoll_fd, EPOLL_CTL_ADD, fd, &ev);
-        if (ret == 0) {
+        int ret = epoll_ctl(_event_fd, EPOLL_CTL_ADD, fd, &ev);
+        if (ret != -1) {
+            _event_map.emplace(fd, std::make_shared<PollEventCB>(std::move(cb)));
+        }
+        return ret;
+#elif defined(HAS_KQUEUE)
+        struct kevent kev[2];
+        int index = 0;
+        if (event & Event_Read) {
+            EV_SET(&kev[index++], fd, EVFILT_READ, EV_ADD, 0, 0, nullptr);
+        }
+        if (event & Event_Write) {
+            EV_SET(&kev[index++], fd, EVFILT_WRITE, EV_ADD, 0, 0, nullptr);
+        }
+        int ret = kevent(_event_fd, kev, index, nullptr, 0, nullptr);
+        if (ret != -1) {
             _event_map.emplace(fd, std::make_shared<PollEventCB>(std::move(cb)));
         }
         return ret;
 #else
-#ifndef _WIN32
-        //win32平台，socket套接字不等于文件描述符，所以可能不适用这个限制
-        if (fd >= FD_SETSIZE || _event_map.size() >= FD_SETSIZE) {
+        if (fd >= FD_SETSIZE) {
             WarnL << "select() can not watch fd bigger than " << FD_SETSIZE;
             return -1;
         }
-#endif
         auto record = std::make_shared<Poll_Record>();
+        record->fd = fd;
         record->event = event;
         record->call_back = std::move(cb);
         _event_map.emplace(fd, record);
         return 0;
-#endif //HAS_EPOLL
+#endif
     }
 
     async([this, fd, event, cb]() mutable {
@@ -145,14 +167,34 @@ int EventPoller::delEvent(int fd, PollCompleteCB cb) {
 
     if (isCurrentThread()) {
 #if defined(HAS_EPOLL)
-        bool success = epoll_ctl(_epoll_fd, EPOLL_CTL_DEL, fd, nullptr) == 0 && _event_map.erase(fd) > 0;
-        cb(success);
-        return success ? 0 : -1;
+        int ret = -1;
+        if (_event_map.erase(fd)) {
+            _event_cache_expired.emplace(fd);
+            ret = epoll_ctl(_event_fd, EPOLL_CTL_DEL, fd, nullptr);
+        }
+        cb(ret != -1);
+        return ret;
+#elif defined(HAS_KQUEUE)
+        int ret = -1;
+        if (_event_map.erase(fd)) {
+            _event_cache_expired.emplace(fd);
+            struct kevent kev[2];
+            int index = 0;
+            EV_SET(&kev[index++], fd, EVFILT_READ, EV_DELETE, 0, 0, nullptr);
+            EV_SET(&kev[index++], fd, EVFILT_WRITE, EV_DELETE, 0, 0, nullptr);
+            ret = kevent(_event_fd, kev, index, nullptr, 0, nullptr);
+        }
+        cb(ret != -1);
+        return ret;
 #else
-        cb(_event_map.erase(fd));
-        return 0;
+        int ret = -1;
+        if (_event_map.erase(fd)) {
+            _event_cache_expired.emplace(fd);
+            ret = 0;
+        }
+        cb(ret != -1);
+        return ret;
 #endif //HAS_EPOLL
-
     }
 
     //跨线程操作
@@ -172,8 +214,16 @@ int EventPoller::modifyEvent(int fd, int event, PollCompleteCB cb) {
         struct epoll_event ev = { 0 };
         ev.events = toEpoll(event);
         ev.data.fd = fd;
-        auto ret = epoll_ctl(_epoll_fd, EPOLL_CTL_MOD, fd, &ev);
-        cb(ret == 0);
+        auto ret = epoll_ctl(_event_fd, EPOLL_CTL_MOD, fd, &ev);
+        cb(ret != -1);
+        return ret;
+#elif defined(HAS_KQUEUE)
+        struct kevent kev[2];
+        int index = 0;
+        EV_SET(&kev[index++], fd, EVFILT_READ, event & Event_Read ? EV_ADD : EV_DELETE, 0, 0, nullptr);
+        EV_SET(&kev[index++], fd, EVFILT_WRITE, event & Event_Write ? EV_ADD : EV_DELETE, 0, 0, nullptr);
+        int ret = kevent(_event_fd, kev, index, nullptr, 0, nullptr);
+        cb(ret != -1);
         return ret;
 #else
         auto it = _event_map.find(fd);
@@ -181,7 +231,7 @@ int EventPoller::modifyEvent(int fd, int event, PollCompleteCB cb) {
             it->second->event = event;
         }
         cb(it != _event_map.end());
-        return 0;
+        return it != _event_map.end() ? 0 : -1;
 #endif // HAS_EPOLL
     }
     async([this, fd, event, cb]() mutable {
@@ -297,23 +347,75 @@ void EventPoller::runLoop(bool blocked, bool ref_self) {
         while (!_exit_flag) {
             minDelay = getMinDelay();
             startSleep();//用于统计当前线程负载情况
-            int ret = epoll_wait(_epoll_fd, events, EPOLL_SIZE, minDelay ? minDelay : -1);
+            int ret = epoll_wait(_event_fd, events, EPOLL_SIZE, minDelay ? minDelay : -1);
             sleepWakeUp();//用于统计当前线程负载情况
             if (ret <= 0) {
                 //超时或被打断
                 continue;
             }
+
+            _event_cache_expired.clear();
+
             for (int i = 0; i < ret; ++i) {
                 struct epoll_event &ev = events[i];
                 int fd = ev.data.fd;
+                if (_event_cache_expired.count(fd)) {
+                    //event cache refresh
+                    continue;
+                }
+
                 auto it = _event_map.find(fd);
                 if (it == _event_map.end()) {
-                    epoll_ctl(_epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
+                    epoll_ctl(_event_fd, EPOLL_CTL_DEL, fd, nullptr);
                     continue;
                 }
                 auto cb = it->second;
                 try {
                     (*cb)(toPoller(ev.events));
+                } catch (std::exception &ex) {
+                    ErrorL << "Exception occurred when do event task: " << ex.what();
+                }
+            }
+        }
+#elif defined(HAS_KQUEUE)
+        struct kevent kevents[KEVENT_SIZE];
+        while (!_exit_flag) {
+            minDelay = getMinDelay();
+            struct timespec timeout = { (long)minDelay / 1000, (long)minDelay % 1000 * 1000000 };
+
+            startSleep();
+            int ret = kevent(_event_fd, nullptr, 0, kevents, KEVENT_SIZE, minDelay ? &timeout : nullptr);
+            sleepWakeUp();
+            if (ret <= 0) {
+                continue;
+            }
+
+            _event_cache_expired.clear();
+
+            for (int i = 0; i < ret; ++i) {
+                auto &kev = kevents[i];
+                auto fd = kev.ident;
+                if (_event_cache_expired.count(fd)) {
+                    // event cache refresh
+                    continue;
+                }
+
+                auto it = _event_map.find(fd);
+                if (it == _event_map.end()) {
+                    EV_SET(&kev, fd, kev.filter, EV_DELETE, 0, 0, nullptr);
+                    kevent(_event_fd, &kev, 1, nullptr, 0, nullptr);
+                    continue;
+                }
+                auto cb = it->second;
+                int event = 0;
+                switch (kev.filter) {
+                    case EVFILT_READ: event = Event_Read; break;
+                    case EVFILT_WRITE: event = Event_Write; break;
+                    default: WarnL << "unknown kevent filter: " << kev.filter; break;
+                }
+
+                try {
+                    (*cb)(event);
                 } catch (std::exception &ex) {
                     ErrorL << "Exception occurred when do event task: " << ex.what();
                 }
@@ -357,6 +459,9 @@ void EventPoller::runLoop(bool blocked, bool ref_self) {
                 //超时或被打断
                 continue;
             }
+
+            _event_cache_expired.clear();
+
             //收集select事件类型
             for (auto &pr : _event_map) {
                 int event = 0;
@@ -375,7 +480,12 @@ void EventPoller::runLoop(bool blocked, bool ref_self) {
                 }
             }
 
-            callback_list.for_each([](Poll_Record::Ptr &record) {
+            callback_list.for_each([&](Poll_Record::Ptr &record) {
+                if (_event_cache_expired.count(record->fd)) {
+                    //event cache refresh
+                    return;
+                }
+
                 try {
                     record->call_back(record->attach);
                 } catch (std::exception &ex) {
@@ -444,6 +554,7 @@ EventPoller::DelayTask::Ptr EventPoller::doDelayTask(uint64_t delay_ms, function
     });
     return ret;
 }
+
 
 ///////////////////////////////////////////////
 
