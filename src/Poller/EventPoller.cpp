@@ -35,8 +35,8 @@
                             | (((event) & Event_Error) ? (EPOLLHUP | EPOLLERR) : 0) \
                             | (((event) & Event_LT)    ? 0 : EPOLLET)
 
-#define toPoller(epoll_event)     (((epoll_event) & EPOLLIN) ? Event_Read   : 0) \
-                                | (((epoll_event) & EPOLLOUT) ? Event_Write : 0) \
+#define toPoller(epoll_event)     (((epoll_event) & (EPOLLIN | EPOLLRDNORM | EPOLLHUP)) ? Event_Read   : 0) \
+                                | (((epoll_event) & (EPOLLOUT | EPOLLWRNORM)) ? Event_Write : 0) \
                                 | (((epoll_event) & EPOLLHUP) ? Event_Error : 0) \
                                 | (((epoll_event) & EPOLLERR) ? Event_Error : 0)
 #define create_event() epoll_create(EPOLL_SIZE)
@@ -104,7 +104,7 @@ EventPoller::~EventPoller() {
 #endif
 
     //退出前清理管道中的数据
-    onPipeEvent();
+    onPipeEvent(true);
     InfoL << getThreadName();
 }
 
@@ -118,7 +118,7 @@ int EventPoller::addEvent(int fd, int event, PollEventCB cb) {
     if (isCurrentThread()) {
 #if defined(HAS_EPOLL)
         struct epoll_event ev = {0};
-        ev.events = (toEpoll(event)) | EPOLLEXCLUSIVE;
+        ev.events = toEpoll(event) ;
         ev.data.fd = fd;
         int ret = epoll_ctl(_event_fd, EPOLL_CTL_ADD, fd, &ev);
         if (ret != -1) {
@@ -129,10 +129,10 @@ int EventPoller::addEvent(int fd, int event, PollEventCB cb) {
         struct kevent kev[2];
         int index = 0;
         if (event & Event_Read) {
-            EV_SET(&kev[index++], fd, EVFILT_READ, EV_ADD, 0, 0, nullptr);
+            EV_SET(&kev[index++], fd, EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, nullptr);
         }
         if (event & Event_Write) {
-            EV_SET(&kev[index++], fd, EVFILT_WRITE, EV_ADD, 0, 0, nullptr);
+            EV_SET(&kev[index++], fd, EVFILT_WRITE, EV_ADD | EV_CLEAR, 0, 0, nullptr);
         }
         int ret = kevent(_event_fd, kev, index, nullptr, 0, nullptr);
         if (ret != -1) {
@@ -140,10 +140,13 @@ int EventPoller::addEvent(int fd, int event, PollEventCB cb) {
         }
         return ret;
 #else
+#ifndef _WIN32
+        // win32平台，socket套接字不等于文件描述符，所以可能不适用这个限制
         if (fd >= FD_SETSIZE) {
             WarnL << "select() can not watch fd bigger than " << FD_SETSIZE;
             return -1;
         }
+#endif
         auto record = std::make_shared<Poll_Record>();
         record->fd = fd;
         record->event = event;
@@ -220,8 +223,8 @@ int EventPoller::modifyEvent(int fd, int event, PollCompleteCB cb) {
 #elif defined(HAS_KQUEUE)
         struct kevent kev[2];
         int index = 0;
-        EV_SET(&kev[index++], fd, EVFILT_READ, event & Event_Read ? EV_ADD : EV_DELETE, 0, 0, nullptr);
-        EV_SET(&kev[index++], fd, EVFILT_WRITE, event & Event_Write ? EV_ADD : EV_DELETE, 0, 0, nullptr);
+        EV_SET(&kev[index++], fd, EVFILT_READ, event & Event_Read ? EV_ADD | EV_CLEAR : EV_DELETE, 0, 0, nullptr);
+        EV_SET(&kev[index++], fd, EVFILT_WRITE, event & Event_Write ? EV_ADD | EV_CLEAR : EV_DELETE, 0, 0, nullptr);
         int ret = kevent(_event_fd, kev, index, nullptr, 0, nullptr);
         cb(ret != -1);
         return ret;
@@ -273,22 +276,24 @@ bool EventPoller::isCurrentThread() {
     return !_loop_thread || _loop_thread->get_id() == this_thread::get_id();
 }
 
-inline void EventPoller::onPipeEvent() {
+inline void EventPoller::onPipeEvent(bool flush) {
     char buf[1024];
     int err = 0;
-    while (true) {
-        if ((err = _pipe.read(buf, sizeof(buf))) > 0) {
-            // 读到管道数据,继续读,直到读空为止
-            continue;
-        }
-        if (err == 0 || get_uv_error(true) != UV_EAGAIN) {
-            // 收到eof或非EAGAIN(无更多数据)错误,说明管道无效了,重新打开管道
-            ErrorL << "Invalid pipe fd of event poller, reopen it";
-            delEvent(_pipe.readFD());
-            _pipe.reOpen();
-            addEventPipe();
-        }
-        break;
+    if (!flush) {
+       for (;;) {
+         if ((err = _pipe.read(buf, sizeof(buf))) > 0) {
+             // 读到管道数据,继续读,直到读空为止
+             continue;
+         }
+         if (err == 0 || get_uv_error(true) != UV_EAGAIN) {
+             // 收到eof或非EAGAIN(无更多数据)错误,说明管道无效了,重新打开管道
+             ErrorL << "Invalid pipe fd of event poller, reopen it";
+             delEvent(_pipe.readFD());
+             _pipe.reOpen();
+             addEventPipe();
+         }
+         break;
+      }
     }
 
     decltype(_list_task) _list_swap;
@@ -308,13 +313,15 @@ inline void EventPoller::onPipeEvent() {
     });
 }
 
-BufferRaw::Ptr EventPoller::getSharedBuffer() {
-    auto ret = _shared_buffer.lock();
+SocketRecvBuffer::Ptr EventPoller::getSharedBuffer(bool is_udp) {
+#if !defined(__linux) && !defined(__linux__)
+    // 非Linux平台下，tcp和udp共享recvfrom方案，使用同一个buffer
+    is_udp = 0;
+#endif
+    auto ret = _shared_buffer[is_udp].lock();
     if (!ret) {
-        //预留一个字节存放\0结尾符
-        ret = BufferRaw::create();
-        ret->setCapacity(1 + SOCKET_DEFAULT_BUF_SIZE);
-        _shared_buffer = ret;
+        ret = SocketRecvBuffer::create(is_udp);
+        _shared_buffer[is_udp] = ret;
     }
     return ret;
 }
