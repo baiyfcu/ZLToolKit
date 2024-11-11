@@ -72,6 +72,24 @@ int uv_exepath(char *buffer, int *size) {
 
 using namespace std;
 
+#ifndef HAS_CXA_DEMANGLE
+// We only support some compilers that support __cxa_demangle.
+// TODO: Checks if Android NDK has fixed this issue or not.
+#if defined(__ANDROID__) && (defined(__i386__) || defined(__x86_64__))
+#define HAS_CXA_DEMANGLE 0
+#elif (__GNUC__ >= 4 || (__GNUC__ >= 3 && __GNUC_MINOR__ >= 4)) && \
+!defined(__mips__)
+#define HAS_CXA_DEMANGLE 1
+#elif defined(__clang__) && !defined(_MSC_VER)
+#define HAS_CXA_DEMANGLE 1
+#else
+#define HAS_CXA_DEMANGLE 0
+#endif
+#endif
+#if HAS_CXA_DEMANGLE
+#include <cxxabi.h>
+#endif
+
 namespace toolkit {
 
 static constexpr char CCH[] = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
@@ -154,7 +172,8 @@ string exePath(bool isExe /*= true*/) {
     }
 
 #if defined(_WIN32)
-    //windows下把路径统一转换层unix风格，因为后续都是按照unix风格处理的
+    //windows下把路径统一转换层unix风格，因为后续都是按照unix风格处理的  [AUTO-TRANSLATED:33d86ad3]
+    //Convert paths to Unix style under Windows, as subsequent processing is done in Unix style
     for (auto &ch : filePath) {
         if (ch == '\\') {
             ch = '/';
@@ -175,25 +194,29 @@ string exeName(bool isExe /*= true*/) {
     return path.substr(path.rfind('/') + 1);
 }
 
-// string转小写
+// string转小写  [AUTO-TRANSLATED:bf92618b]
+//Convert string to lowercase
 std::string &strToLower(std::string &str) {
     transform(str.begin(), str.end(), str.begin(), towlower);
     return str;
 }
 
-// string转大写
+// string转大写  [AUTO-TRANSLATED:0197b884]
+//Convert string to uppercase
 std::string &strToUpper(std::string &str) {
     transform(str.begin(), str.end(), str.begin(), towupper);
     return str;
 }
 
-// string转小写
+// string转小写  [AUTO-TRANSLATED:bf92618b]
+//Convert string to lowercase
 std::string strToLower(std::string &&str) {
     transform(str.begin(), str.end(), str.begin(), towlower);
     return std::move(str);
 }
 
-// string转大写
+// string转大写  [AUTO-TRANSLATED:0197b884]
+//Convert string to uppercase
 std::string strToUpper(std::string &&str) {
     transform(str.begin(), str.end(), str.begin(), towupper);
     return std::move(str);
@@ -226,7 +249,8 @@ do{ \
     while( s.size() && map.at((unsigned char &)s.front())) s.erase(0,1); \
 }while(0);
 
-//去除前后的空格、回车符、制表符
+//去除前后的空格、回车符、制表符  [AUTO-TRANSLATED:0b0a7fc7]
+//Remove leading and trailing spaces, carriage returns, and tabs
 std::string &trim(std::string &s, const string &chars) {
     TRIM(s, chars);
     return s;
@@ -369,22 +393,26 @@ static inline bool initMillisecondThread() {
         uint64_t microsecond = 0;
         while (true) {
             now = getCurrentMicrosecondOrigin();
-            //记录系统时间戳，可回退
+            //记录系统时间戳，可回退  [AUTO-TRANSLATED:495a0114]
+            //Record system timestamp, can be rolled back
             s_currentMicrosecond_system.store(now, memory_order_release);
             s_currentMillisecond_system.store(now / 1000, memory_order_release);
 
-            //记录流逝时间戳，不可回退
+            //记录流逝时间戳，不可回退  [AUTO-TRANSLATED:7f3a9da3]
+            //Record elapsed timestamp, cannot be rolled back
             int64_t expired = now - last;
             last = now;
             if (expired > 0 && expired < 1000 * 1000) {
-                //流逝时间处于0~1000ms之间，那么是合理的，说明没有调整系统时间
+                //流逝时间处于0~1000ms之间，那么是合理的，说明没有调整系统时间  [AUTO-TRANSLATED:566e1001]
+                //If the elapsed time is between 0~1000ms, it is reasonable, indicating that the system time has not been adjusted
                 microsecond += expired;
                 s_currentMicrosecond.store(microsecond, memory_order_release);
                 s_currentMillisecond.store(microsecond / 1000, memory_order_release);
             } else if (expired != 0) {
                 WarnL << "Stamp expired is abnormal: " << expired;
             }
-            //休眠0.5 ms
+            //休眠0.5 ms  [AUTO-TRANSLATED:5e20acdd]
+            //Sleep for 0.5 ms
             usleep(500);
         }
     });
@@ -574,24 +602,6 @@ bool setThreadAffinity(int i) {
 #endif
     return false;
 }
-
-#ifndef HAS_CXA_DEMANGLE
-// We only support some compilers that support __cxa_demangle.
-// TODO: Checks if Android NDK has fixed this issue or not.
-#if defined(__ANDROID__) && (defined(__i386__) || defined(__x86_64__))
-#define HAS_CXA_DEMANGLE 0
-#elif (__GNUC__ >= 4 || (__GNUC__ >= 3 && __GNUC_MINOR__ >= 4)) && \
-    !defined(__mips__)
-#define HAS_CXA_DEMANGLE 1
-#elif defined(__clang__) && !defined(_MSC_VER)
-#define HAS_CXA_DEMANGLE 1
-#else
-#define HAS_CXA_DEMANGLE 0
-#endif
-#endif
-#if HAS_CXA_DEMANGLE
-#include <cxxabi.h>
-#endif
 
 // Demangle a mangled symbol name and return the demangled name.
 // If 'mangled' isn't mangled in the first place, this function
