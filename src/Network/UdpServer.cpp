@@ -25,7 +25,6 @@ static UdpServer::PeerIdType makeSockId(sockaddr *addr, int) {
     UdpServer::PeerIdType ret;
     switch (addr->sa_family) {
         case AF_INET : {
-            ret.resize(18);
             ret[0] = ((struct sockaddr_in *) addr)->sin_port >> 8;
             ret[1] = ((struct sockaddr_in *) addr)->sin_port & 0xFF;
             //ipv4地址统一转换为ipv6方式处理  [AUTO-TRANSLATED:ad7cf8c3]
@@ -35,13 +34,12 @@ static UdpServer::PeerIdType makeSockId(sockaddr *addr, int) {
             return ret;
         }
         case AF_INET6 : {
-            ret.resize(18);
             ret[0] = ((struct sockaddr_in6 *) addr)->sin6_port >> 8;
             ret[1] = ((struct sockaddr_in6 *) addr)->sin6_port & 0xFF;
             memcpy(&ret[2], &(((struct sockaddr_in6 *)addr)->sin6_addr), 16);
             return ret;
         }
-        default: assert(0); return "";
+        default: throw std::invalid_argument("invalid sockaddr address");
     }
 }
 
@@ -78,7 +76,7 @@ void UdpServer::start_l(uint16_t port, const std::string &host) {
     //主server才创建session map，其他cloned server共享之  [AUTO-TRANSLATED:113cf4fd]
     //Only the main server creates a session map, other cloned servers share it
     _session_mutex = std::make_shared<std::recursive_mutex>();
-    _session_map = std::make_shared<std::unordered_map<PeerIdType, SessionHelper::Ptr> >();
+    _session_map = std::make_shared<SessionMapType>();
 
     // 新建一个定时器定时管理这些 udp 会话,这些对象只由主server做超时管理，cloned server不管理  [AUTO-TRANSLATED:d20478a2]
     //Create a timer to manage these udp sessions periodically, these objects are only managed by the main server, cloned servers do not manage them
@@ -207,7 +205,7 @@ void UdpServer::onManagerSession() {
         std::lock_guard<std::recursive_mutex> lock(*_session_mutex);
         //拷贝map，防止遍历时移除对象  [AUTO-TRANSLATED:ebbc7595]
         //Copy the map to prevent objects from being removed during traversal
-        copy_map = std::make_shared<std::unordered_map<PeerIdType, SessionHelper::Ptr> >(*_session_map);
+        copy_map = std::make_shared<SessionMapType>(*_session_map);
     }
     auto lam = [copy_map]() {
         for (auto &pr : *copy_map) {
@@ -290,10 +288,10 @@ SessionHelper::Ptr UdpServer::createSession(const PeerIdType &id, Buffer::Ptr &b
             if (!strong_self) {
                 return;
             }
-
+            auto new_id = makeSockId(addr, addr_len);
             //快速判断是否为本会话的的数据, 通常应该成立  [AUTO-TRANSLATED:d5d147e4]
             //Quickly determine if it's data for the current session, usually should be true
-            if (id == makeSockId(addr, addr_len)) {
+            if (id == new_id) {
                 if (auto strong_helper = weak_helper.lock()) {
                     emitSessionRecv(strong_helper, buf);
                 }
@@ -302,7 +300,7 @@ SessionHelper::Ptr UdpServer::createSession(const PeerIdType &id, Buffer::Ptr &b
 
             //收到非本peer fd的数据，让server去派发此数据到合适的session对象  [AUTO-TRANSLATED:e5f44445]
             //Received data from a non-current peer fd, let the server dispatch this data to the appropriate session object
-            strong_self->onRead_l(false, id, buf, addr, addr_len);
+            strong_self->onRead_l(false, new_id, buf, addr, addr_len);
         });
         socket->setOnErr([weak_self, weak_helper, id](const SockException &err) {
             // 在本函数作用域结束时移除会话对象  [AUTO-TRANSLATED:b2ade305]
