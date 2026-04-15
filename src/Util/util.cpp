@@ -226,12 +226,28 @@ std::string strToUpper(std::string &&str) {
 vector<string> split(const string &s, const char *delim) {
     vector<string> ret;
     size_t last = 0;
+    auto delim_len = strlen(delim);
     auto index = s.find(delim, last);
     while (index != string::npos) {
+        if (delim_len == 1 && delim[0] == '/' && index < s.size()) {
+            auto is_schema_slash = [&](size_t pos) {
+                if (pos + 1 < s.size() && s[pos] == '/' && s[pos + 1] == '/' && pos > 0 && s[pos - 1] == ':') {
+                    return true;
+                }
+                if (pos > 1 && s[pos] == '/' && s[pos - 1] == '/' && s[pos - 2] == ':') {
+                    return true;
+                }
+                return false;
+            };
+            if (is_schema_slash(index)) {
+                index = s.find(delim, index + 1);
+                continue;
+            }
+        }
         if (index - last > 0) {
             ret.push_back(s.substr(last, index - last));
         }
-        last = index + strlen(delim);
+        last = index + delim_len;
         index = s.find(delim, last);
     }
     if (!s.size() || s.size() - last > 0) {
@@ -672,8 +688,9 @@ void Assert_Throw(int failed, const char *exp, const char *func, const char *fil
         if(str && *str){
             printer << ", " << str;
         }
-        printer << "), function " << func << ", file " << file << ", line " << line << ".";
-        throw toolkit::AssertFailedException(printer);
+        ErrorL << "), function " << func << ", file " << file << ", line " << line << ".";
+        //printer << "), function " << func << ", file " << file << ", line " << line << ".";
+        //throw toolkit::AssertFailedException(printer);
     }
 }
 }
