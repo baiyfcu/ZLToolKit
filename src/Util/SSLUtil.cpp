@@ -387,7 +387,7 @@ string SSLUtil::getServerName(X509 *cer) {
     }
     //获取证书里的域名  [AUTO-TRANSLATED:97830946]
     //Get domain name from certificate
-    X509_NAME *name = X509_get_subject_name(cer);
+    auto *name = X509_get_subject_name(cer);
     char ret[256] = {0};
     X509_NAME_get_text_by_NID(name, NID_commonName, ret, sizeof(ret));
     return ret;
