@@ -41,12 +41,18 @@
                                 | (((epoll_event) & EPOLLHUP) ? Event_Error : 0) \
                                 | (((epoll_event) & EPOLLERR) ? Event_Error : 0)
 #define create_event() epoll_create(EPOLL_SIZE)
+#if !defined(_WIN32)
+#define close_event(fd) close(fd)
+#else
+#define close_event(fd) epoll_close(fd)
+#endif
 #endif //HAS_EPOLL
 
 #if defined(HAS_KQUEUE)
 #include <sys/event.h>
 #define KEVENT_SIZE 1024
 #define create_event() kqueue()
+#define close_event(fd) close(fd)
 #endif // HAS_KQUEUE
 
 using namespace std;
@@ -71,15 +77,40 @@ void EventPoller::addEventPipe() {
 EventPoller::EventPoller(std::string name) {
 #if defined(HAS_EPOLL) || defined(HAS_KQUEUE)
     _event_fd = create_event();
-    if (_event_fd == -1) {
+    if (_event_fd == INVALID_EVENT_FD) {
         throw runtime_error(StrPrinter << "Create event fd failed: " << get_uv_errmsg());
     }
+#if !defined(_WIN32)
     SockUtil::setCloExec(_event_fd);
-#endif //HAS_EPOLL
+#endif
+#endif
 
     _name = std::move(name);
     _logger = Logger::Instance().shared_from_this();
     addEventPipe();
+}
+
+void EventPoller::destroy(EventPoller *ptr) {
+    if (ptr->_loop_thread && ptr->isCurrentThread()) {
+        //最后一个引用在本对象自己的轮询线程上释放(典型情形:Socket的析构任务在这里执行,
+        //而它持有的是本对象的最后一个引用)。此刻runLoop仍在栈上,返回后还要读本对象,在这里
+        //销毁就会读到已释放的内存。只置退出标志让循环结束,由线程函数在runLoop返回后再销毁
+        //The last reference went away on this object's own polling thread (typically a Socket
+        //destructor task running here while holding the last reference to this object). runLoop
+        //is still on the stack and reads this object after returning, so destroying here would
+        //read freed memory. Only raise the exit flag to end the loop; the thread function
+        //destroys the object once runLoop has returned
+        ptr->_pending_delete = true;
+        ptr->_exit_flag = true;
+        //唤醒循环:若最后一个引用是在延时任务里释放的,循环接下来会再进一次epoll_wait,没有
+        //别的定时器时它会无限期等待;写一字节管道让它立即返回、去检查退出标志
+        //Wake the loop: if the last reference went away inside a delayed task, the loop is about to
+        //enter epoll_wait once more and would wait forever with no other timer pending; one byte
+        //on the pipe makes it return at once and check the exit flag
+        ptr->_pipe.write("", 1);
+        return;
+    }
+    delete ptr;
 }
 
 void EventPoller::shutdown() {
@@ -100,14 +131,37 @@ EventPoller::~EventPoller() {
     shutdown();
     
 #if defined(HAS_EPOLL) || defined(HAS_KQUEUE)
-    if (_event_fd != -1) {
-        close(_event_fd);
-        _event_fd = -1;
+    if (_event_fd != INVALID_EVENT_FD) {
+        bool can_close = true;
+#if defined(_WIN32)
+        //轮询线程没能正常走出循环时就不关句柄:进程退出时Windows会先杀掉其余线程,被杀的线程
+        //在wepoll的epoll_wait里持有的引用永远不会释放,epoll_close于是死等(wepoll.c:1413)。
+        //注意该条件不止进程退出一种成因——运行期间管道写失败同样会落到这里,那就是真泄漏了,
+        //只是进程退出是目前唯一观察到的情形
+        //Do not close the handle when the polling thread failed to leave its loop: while a process
+        //exits Windows kills the other threads first, and the reference such a thread holds inside
+        //the epoll_wait of wepoll is never released, so epoll_close waits forever (wepoll.c:1413).
+        //Note this covers more than process exit: a failing pipe write at run time lands here too
+        //and the handle then really leaks; process exit is merely the only case observed so far
+        can_close = _exit_flag;
+#endif
+        if (can_close) {
+            close_event(_event_fd);
+        }
+        _event_fd = INVALID_EVENT_FD;
     }
 #endif
 
     //退出前清理管道中的数据  [AUTO-TRANSLATED:60e26f9a]
     //Clean up pipe data before exiting
+    //已知残留风险,仅限Windows:该平台在进程退出时强行终止其余线程,被终止的轮询线程若恰好
+    //持有下面onPipeEvent要取的_mtx_task,此处将永久阻塞。其余平台不强杀线程,且上面的
+    //shutdown()已join过轮询线程(即线程系正常退出、不可能持锁),因此不存在该风险
+    //Known residual risk, Windows only: that platform kills the other threads while a process
+    //exits, and if the killed polling thread happened to hold the _mtx_task that onPipeEvent
+    //takes below, this blocks forever. The other platforms do not kill threads, and shutdown()
+    //above has already joined the polling thread (so it exited normally and cannot hold the
+    //lock), hence the risk does not exist there
     onPipeEvent(true);
     InfoL << getThreadName();
 }
@@ -128,6 +182,7 @@ int EventPoller::addEvent(int fd, int event, PollEventCB cb) {
         if (ret != -1) {
             _event_map.emplace(fd, std::make_shared<PollEventCB>(std::move(cb)));
         }
+        _fd_count = _event_map.size();
         return ret;
 #elif defined(HAS_KQUEUE)
         struct kevent kev[2];
@@ -142,6 +197,7 @@ int EventPoller::addEvent(int fd, int event, PollEventCB cb) {
         if (ret != -1) {
             _event_map.emplace(fd, std::make_shared<PollEventCB>(std::move(cb)));
         }
+        _fd_count = _event_map.size();
         return ret;
 #else
 #ifndef _WIN32
@@ -157,6 +213,7 @@ int EventPoller::addEvent(int fd, int event, PollEventCB cb) {
         record->event = event;
         record->call_back = std::move(cb);
         _event_map.emplace(fd, record);
+        _fd_count = _event_map.size();
         return 0;
 #endif
     }
@@ -181,6 +238,7 @@ int EventPoller::delEvent(int fd, PollCompleteCB cb) {
             ret = epoll_ctl(_event_fd, EPOLL_CTL_DEL, fd, nullptr);
         }
         cb(ret != -1);
+        _fd_count = _event_map.size();
         return ret;
 #elif defined(HAS_KQUEUE)
         int ret = -1;
@@ -193,6 +251,7 @@ int EventPoller::delEvent(int fd, PollCompleteCB cb) {
             ret = kevent(_event_fd, kev, index, nullptr, 0, nullptr);
         }
         cb(ret != -1);
+        _fd_count = _event_map.size();
         return ret;
 #else
         int ret = -1;
@@ -201,6 +260,7 @@ int EventPoller::delEvent(int fd, PollCompleteCB cb) {
             ret = 0;
         }
         cb(ret != -1);
+        _fd_count = _event_map.size();
         return ret;
 #endif //HAS_EPOLL
     }
@@ -247,6 +307,10 @@ int EventPoller::modifyEvent(int fd, int event, PollCompleteCB cb) {
         modifyEvent(fd, event, std::move(cb));
     });
     return 0;
+}
+
+size_t EventPoller::fdCount() const {
+    return _fd_count;
 }
 
 Task::Ptr EventPoller::async(TaskIn task, bool may_sync) {
@@ -358,17 +422,17 @@ void EventPoller::runLoop(bool blocked, bool ref_self) {
         }
         _sem_run_started.post();
         _exit_flag = false;
-        uint64_t minDelay;
+        int64_t minDelay;
 #if defined(HAS_EPOLL)
         struct epoll_event events[EPOLL_SIZE];
         while (!_exit_flag) {
             minDelay = getMinDelay();
-            startSleep();//用于统计当前线程负载情况
-            int ret = epoll_wait(_event_fd, events, EPOLL_SIZE, minDelay ? minDelay : -1);
-            sleepWakeUp();//用于统计当前线程负载情况
+            startSleep(); // 用于统计当前线程负载情况
+            int ret = epoll_wait(_event_fd, events, EPOLL_SIZE, minDelay);
+            sleepWakeUp(); // 用于统计当前线程负载情况
             if (ret <= 0) {
-                //超时或被打断  [AUTO-TRANSLATED:7005fded]
-                //Timed out or interrupted
+                // 超时或被打断  [AUTO-TRANSLATED:7005fded]
+                // Timed out or interrupted
                 continue;
             }
 
@@ -378,7 +442,7 @@ void EventPoller::runLoop(bool blocked, bool ref_self) {
                 struct epoll_event &ev = events[i];
                 int fd = ev.data.fd;
                 if (_event_cache_expired.count(fd)) {
-                    //event cache refresh
+                    // event cache refresh
                     continue;
                 }
 
@@ -402,7 +466,7 @@ void EventPoller::runLoop(bool blocked, bool ref_self) {
             struct timespec timeout = { (long)minDelay / 1000, (long)minDelay % 1000 * 1000000 };
 
             startSleep();
-            int ret = kevent(_event_fd, nullptr, 0, kevents, KEVENT_SIZE, minDelay ? &timeout : nullptr);
+            int ret = kevent(_event_fd, nullptr, 0, kevents, KEVENT_SIZE, minDelay == -1 ? nullptr : &timeout);
             sleepWakeUp();
             if (ret <= 0) {
                 continue;
@@ -445,10 +509,10 @@ void EventPoller::runLoop(bool blocked, bool ref_self) {
         List<Poll_Record::Ptr> callback_list;
         struct timeval tv;
         while (!_exit_flag) {
-            //定时器事件中可能操作_event_map  [AUTO-TRANSLATED:f2a50ee2]
-            //Possible operations on _event_map in timer events
+            // 定时器事件中可能操作_event_map  [AUTO-TRANSLATED:f2a50ee2]
+            // Possible operations on _event_map in timer events
             minDelay = getMinDelay();
-            tv.tv_sec = (decltype(tv.tv_sec)) (minDelay / 1000);
+            tv.tv_sec = (decltype(tv.tv_sec))(minDelay / 1000);
             tv.tv_usec = 1000 * (minDelay % 1000);
 
             set_read.fdZero();
@@ -460,30 +524,30 @@ void EventPoller::runLoop(bool blocked, bool ref_self) {
                     max_fd = pr.first;
                 }
                 if (pr.second->event & Event_Read) {
-                    set_read.fdSet(pr.first);//监听管道可读事件
+                    set_read.fdSet(pr.first); // 监听管道可读事件
                 }
                 if (pr.second->event & Event_Write) {
-                    set_write.fdSet(pr.first);//监听管道可写事件
+                    set_write.fdSet(pr.first); // 监听管道可写事件
                 }
                 if (pr.second->event & Event_Error) {
-                    set_err.fdSet(pr.first);//监听管道错误事件
+                    set_err.fdSet(pr.first); // 监听管道错误事件
                 }
             }
 
-            startSleep();//用于统计当前线程负载情况
-            ret = zl_select(max_fd + 1, &set_read, &set_write, &set_err, minDelay ? &tv : nullptr);
-            sleepWakeUp();//用于统计当前线程负载情况
+            startSleep(); // 用于统计当前线程负载情况
+            ret = zl_select(max_fd + 1, &set_read, &set_write, &set_err, minDelay == -1 ? nullptr : &tv);
+            sleepWakeUp(); // 用于统计当前线程负载情况
 
             if (ret <= 0) {
-                //超时或被打断  [AUTO-TRANSLATED:7005fded]
-                //Timed out or interrupted
+                // 超时或被打断  [AUTO-TRANSLATED:7005fded]
+                // Timed out or interrupted
                 continue;
             }
 
             _event_cache_expired.clear();
 
-            //收集select事件类型  [AUTO-TRANSLATED:9a5c41d3]
-            //Collect select event types
+            // 收集select事件类型  [AUTO-TRANSLATED:9a5c41d3]
+            // Collect select event types
             for (auto &pr : _event_map) {
                 int event = 0;
                 if (set_read.isSet(pr.first)) {
@@ -503,7 +567,7 @@ void EventPoller::runLoop(bool blocked, bool ref_self) {
 
             callback_list.for_each([&](Poll_Record::Ptr &record) {
                 if (_event_cache_expired.count(record->fd)) {
-                    //event cache refresh
+                    // event cache refresh
                     return;
                 }
 
@@ -517,12 +581,36 @@ void EventPoller::runLoop(bool blocked, bool ref_self) {
         }
 #endif //HAS_EPOLL
     } else {
-        _loop_thread = new thread(&EventPoller::runLoop, this, true, ref_self);
+        _loop_thread = new thread([this, ref_self]() {
+            runLoop(true, ref_self);
+            if (_pending_delete) {
+                //最后一个引用已在本线程上释放(见destroy),runLoop已返回,此时销毁是安全的。
+                //线程对象由本线程自己脱离后释放,析构里的shutdown()见_loop_thread为空即跳过join
+                //The last reference went away on this thread (see destroy) and runLoop has returned,
+                //so destroying is safe now. The thread object is detached and freed by this very
+                //thread; shutdown() in the destructor sees _loop_thread null and skips the join
+                //已知边界:若进程恰在此刻退出,主线程的exit()不会等待本线程(已脱离),析构可能被
+                //截断,下面析构里那条日志也可能读到已被静态析构回收的模块名——只发生在进程
+                //退出期,退出码不受影响(实测),最多丢一条析构日志或其模块名字段为乱码;
+                //运行期释放池子时本线程会完整跑完析构(实测)
+                //Known corner: if the process happens to be exiting right now, exit() on the main
+                //thread does not wait for this (detached) thread: the destruction may be cut short,
+                //and the log line inside the destructor may read a module name already torn down by
+                //static destruction. That only happens while the process exits, the exit code is not
+                //affected (measured), at worst that one log line is lost or its module field is
+                //garbage; when a pool is released at run time this thread finishes the destruction
+                //in full (measured)
+                _loop_thread->detach();
+                delete _loop_thread;
+                _loop_thread = nullptr;
+                delete this;
+            }
+        });
         _sem_run_started.wait();
     }
 }
 
-uint64_t EventPoller::flushDelayTask(uint64_t now_time) {
+int64_t EventPoller::flushDelayTask(uint64_t now_time) {
     decltype(_delay_task_map) task_copy;
     task_copy.swap(_delay_task_map);
 
@@ -548,19 +636,19 @@ uint64_t EventPoller::flushDelayTask(uint64_t now_time) {
     if (it == _delay_task_map.end()) {
         //没有剩余的定时器了  [AUTO-TRANSLATED:23b1119e]
         //No remaining timers
-        return 0;
+        return -1;
     }
     //最近一个定时器的执行延时  [AUTO-TRANSLATED:2535621b]
     //Delay in execution of the last timer
     return it->first - now_time;
 }
 
-uint64_t EventPoller::getMinDelay() {
+int64_t EventPoller::getMinDelay() {
     auto it = _delay_task_map.begin();
     if (it == _delay_task_map.end()) {
         //没有剩余的定时器了  [AUTO-TRANSLATED:23b1119e]
         //No remaining timers
-        return 0;
+        return -1;
     }
     auto now = getCurrentMillisecond();
     if (it->first > now) {

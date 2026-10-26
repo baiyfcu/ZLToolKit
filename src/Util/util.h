@@ -222,6 +222,8 @@ public:
 };
 
 std::string makeRandStr(int sz, bool printable = true);
+uint64_t makeRandNum();
+std::string makeUuidStr();
 std::string hexdump(const void *buf, size_t len);
 std::string hexmem(const void* buf, size_t len);
 std::string exePath(bool isExe = true);
@@ -317,8 +319,19 @@ const char *strcasestr(const char *big, const char *little);
 #endif //WIN32
 
 /**
- * 获取时间差, 返回值单位为秒
- * Get time difference, return value in seconds
+ * 获取时间差, 返回值单位为秒, 已包含夏令时修正
+ * 注意: 本函数不加锁、不调用libc。时区在[启动前一年, 启动后二十年]内的全部切换点在静态
+ * 初始化阶段一次性算成只读表, 之后只查表; 运行期修改时区或升级时区数据库的程序需要重启,
+ * 早于表起点的时刻按首段换算, 晚于终点的按末段; 早于本库静态初始化的调用(其它编译单元的
+ * 全局对象构造期间)得到的是UTC占位值0
+ * Get time difference, return value in seconds, daylight saving time included
+ * Note: this function takes no lock and does not call into libc. Every switch of the
+ * timezone within [one year before start up, twenty years after] is computed once into a
+ * read-only table during static initialization and only that table is consulted afterwards;
+ * a program that changes its timezone or updates the timezone database at run time needs a
+ * restart, a moment before the table is converted with its first segment and one beyond it
+ * with the last; a call made before the static initialization of this library (while global
+ * objects of other translation units are being constructed) gets the UTC placeholder 0
  
  * [AUTO-TRANSLATED:43d2403a]
  */
@@ -358,9 +371,17 @@ std::string getTimeStr(const char *fmt,time_t time = 0);
 
 /**
  * 根据unix时间戳获取本地时间
+ * 注意1: 每条时间戳按它自身所处的时段取偏移, 其它季节的时间戳同样正确; 早于启动前一年的
+ *        时间戳按表的首段换算, 见getGMTOff()的说明
+ * 注意2: 不加锁、不调用libc, 可在任何线程、包括fork()出的子进程中调用
  * @param sec unix时间戳
  * @return tm结构体
  * Get local time based on Unix timestamp
+ * Note 1: every timestamp takes the offset of the period it belongs to, so a timestamp of
+ *         another season is correct as well; one earlier than a year before start up is
+ *         converted with the first segment of the table, see getGMTOff()
+ * Note 2: takes no lock and does not call into libc, safe from any thread and from a
+ *         fork()ed child process
  * @param sec Unix timestamp
  * @return tm structure
  
@@ -435,6 +456,18 @@ public:
     }
 
     template <typename T, typename... ArgsType>
+    static Any make(ArgsType &&...args) {
+        Any ret;
+        ret.set<T>(std::forward<ArgsType>(args)...);
+        return ret;
+    }
+
+    template <typename T>
+    Any(std::shared_ptr<T> data) {
+        set<T>(std::move(data));
+    }
+
+    template <typename T, typename... ArgsType>
     void set(ArgsType &&...args) {
         _type = &typeid(T);
         _data.reset(new T(std::forward<ArgsType>(args)...), [](void *ptr) { delete (T *)ptr; });
@@ -461,9 +494,22 @@ public:
         return *((T *)_data.get());
     }
 
+    void *get() { return _data.get(); }
+
     template <typename T>
     const T &get(bool safe = true) const {
         return const_cast<Any &>(*this).get<T>(safe);
+    }
+
+    template <typename T>
+    std::shared_ptr<T> get_shared(bool safe = true) {
+        if (!_data) {
+            throw std::invalid_argument("Any is empty");
+        }
+        if (safe && !is<T>()) {
+            throw std::invalid_argument("Any::get(): " + demangle(_type->name()) + " unable cast to " + demangle(typeid(T).name()));
+        }
+        return std::static_pointer_cast<T>(_data);
     }
 
     template <typename T>
@@ -472,6 +518,7 @@ public:
     }
 
     operator bool() const { return _data.operator bool(); }
+
     bool empty() const { return !bool(); }
 
     void reset() {

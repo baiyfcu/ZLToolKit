@@ -67,6 +67,7 @@ Socket::Socket(EventPoller::Ptr poller, bool enable_mutex)
     , _mtx_event(enable_mutex)
     , _mtx_send_buf_waiting(enable_mutex)
     , _mtx_send_buf_sending(enable_mutex) {
+    memset(&_peer_addr, 0, sizeof _peer_addr);
     setOnRead(nullptr);
     setOnErr(nullptr);
     setOnAccept(nullptr);
@@ -276,6 +277,13 @@ bool Socket::attachEvent(const SockNum::Ptr &sock) {
     // tcp客户端或udp  [AUTO-TRANSLATED:00c16e7f]
     //TCP client or UDP
     auto read_buffer = _poller->getSharedBuffer(sock->type() == SockNum::Sock_UDP);
+    if (sock->type() == SockNum::Sock_UDP) {
+        LOCK_GUARD(_mtx_sock_fd);
+        _udp_recv_buffer_frozen = true;
+        if (_read_buffer) {
+            read_buffer = _read_buffer;
+        }
+    }
     auto result = _poller->addEvent(sock->rawFd(), EventPoller::Event_Read | EventPoller::Event_Error | EventPoller::Event_Write, [weak_self, sock, read_buffer](int event) {
         auto strong_self = weak_self.lock();
         if (!strong_self) {
@@ -297,6 +305,10 @@ bool Socket::attachEvent(const SockNum::Ptr &sock) {
         }
     });
 
+    if (result == -1 && sock->type() == SockNum::Sock_UDP) {
+        LOCK_GUARD(_mtx_sock_fd);
+        _udp_recv_buffer_frozen = false;
+    }
     return -1 != result;
 }
 
@@ -320,7 +332,9 @@ ssize_t Socket::onRead(const SockNum::Ptr &sock, const SocketRecvBuffer::Ptr &bu
                 if (sock->type() == SockNum::Sock_TCP) {
                     emitErr(toSockException(err));
                 } else {
-                    WarnL << "Recv err on udp socket[" << sock->rawFd() << "]: " << uv_strerror(err);
+                    if (!(err == UV_ECONNREFUSED && _ignore_udp_conn_refused.load(std::memory_order_acquire))) {
+                        WarnL << "Recv err on udp socket[" << sock->rawFd() << "]: " << uv_strerror(err);
+                    }
                 }
             }
             return ret;
@@ -396,6 +410,11 @@ ssize_t Socket::send(Buffer::Ptr buf, struct sockaddr *addr, socklen_t addr_len,
         //This send did not specify a target address, but the target is customized through bindPeerAddr
         addr = (struct sockaddr *)_udp_send_dst.get();
         addr_len = SockUtil::get_sock_len(addr);
+    } else {
+        if (_peer_addr.ss_family != AF_UNSPEC) {
+            // udp connect后不能再sendto指定其他地址
+            return send_l(std::move(buf), false, try_flush);
+        }
     }
     return send_l(std::make_shared<BufferSock>(std::move(buf), addr, addr_len), true, try_flush);
 }
@@ -479,6 +498,7 @@ void Socket::closeSock(bool close_fd) {
         if (close_fd) {
             _err_emit = false;
             _sock_fd = nullptr;
+            _udp_recv_buffer_frozen = false;
         } else if (_sock_fd) {
             _sock_fd->delEvent();
         }
@@ -503,14 +523,24 @@ uint64_t Socket::elapsedTimeAfterFlushed() {
     return _send_flush_ticker.elapsedTime();
 }
 
-int Socket::getRecvSpeed() {
+size_t Socket::getRecvSpeed() {
     _enable_speed = true;
     return _recv_speed.getSpeed();
 }
 
-int Socket::getSendSpeed() {
+size_t Socket::getSendSpeed() {
     _enable_speed = true;
     return _send_speed.getSpeed();
+}
+
+size_t Socket::getRecvTotalBytes() {
+    _enable_speed = true;
+    return _recv_speed.getTotalBytes();
+}
+
+size_t Socket::getSendTotalBytes() {
+    _enable_speed = true;
+    return _send_speed.getTotalBytes();
 }
 
 bool Socket::listen(uint16_t port, const string &local_ip, int backlog) {
@@ -545,6 +575,16 @@ bool Socket::fromSock_l(SockNum::Ptr sock) {
     }
     setSock(std::move(sock));
     return true;
+}
+
+void Socket::moveTo(EventPoller::Ptr poller) {
+    LOCK_GUARD(_mtx_sock_fd);
+    if (poller) {
+        _poller = std::move(poller);
+    }
+    if (_sock_fd) {
+        _sock_fd = std::make_shared<SockFD>(_sock_fd->sockNum(), _poller);
+    }
 }
 
 int Socket::onAccept(const SockNum::Ptr &sock, int event) noexcept {
@@ -677,6 +717,7 @@ void Socket::setSock(SockNum::Ptr sock) {
         SockUtil::get_sock_peer_addr(_sock_fd->rawFd(), _peer_addr);
     } else {
         _sock_fd = nullptr;
+        _udp_recv_buffer_frozen = false;
     }
 }
 
@@ -694,6 +735,17 @@ uint16_t Socket::get_local_port() {
         return 0;
     }
     return SockUtil::inet_port((struct sockaddr *)&_local_addr);
+}
+
+const sockaddr *Socket::get_local_addr() {
+    return (const sockaddr*)&_local_addr;
+}
+
+const sockaddr *Socket::get_peer_addr() {
+    if (_udp_send_dst)
+        return (const sockaddr *)_udp_send_dst.get();
+    else
+        return (const sockaddr *)&_peer_addr;
 }
 
 string Socket::get_peer_ip() {
@@ -816,7 +868,7 @@ bool Socket::flushData(const SockNum::Ptr &sock, bool poller_thread) {
             // udp发送异常，把数据丢弃  [AUTO-TRANSLATED:3a7d095d]
             //UDP send exception, discard the data
             send_buf_sending_tmp.pop_front();
-            WarnL << "Send udp socket[" << sock << "] failed, data ignored: " << uv_strerror(err);
+            WarnL << "Send udp socket[" << sock->rawFd() << "] failed, data ignored: " << uv_strerror(err);
             continue;
         }
         // tcp发送失败时，触发异常  [AUTO-TRANSLATED:06f06449]
@@ -930,18 +982,27 @@ const EventPoller::Ptr &Socket::getPoller() const {
     return _poller;
 }
 
-bool Socket::cloneSocket(const Socket &other) {
+std::shared_ptr<void> Socket::cloneSocket(const Socket &other) {
     closeSock();
     SockNum::Ptr sock;
     {
         LOCK_GUARD(other._mtx_sock_fd);
         if (!other._sock_fd) {
             WarnL << "sockfd of src socket is null";
-            return false;
+            return nullptr;
         }
         sock = other._sock_fd->sockNum();
     }
-    return fromSock_l(sock);
+    setSock(sock);
+    std::weak_ptr<Socket> weak_self = shared_from_this();
+    // 0x01无实际意义，仅代表成功
+    return std::shared_ptr<void>(reinterpret_cast<void *>(0x01), [weak_self, sock](void *) {
+        if (auto strong_self = weak_self.lock()) {
+            if (!strong_self->attachEvent(sock)) {
+                WarnL << "attachEvent failed: " << sock->rawFd();
+            }
+        }
+    });
 }
 
 bool Socket::bindPeerAddr(const struct sockaddr *dst_addr, socklen_t addr_len, bool soft_bind) {
@@ -952,7 +1013,8 @@ bool Socket::bindPeerAddr(const struct sockaddr *dst_addr, socklen_t addr_len, b
     if (_sock_fd->type() != SockNum::Sock_UDP) {
         return false;
     }
-    addr_len = addr_len ? addr_len : SockUtil::get_sock_len(dst_addr);
+    // 强制覆盖addr_len，否则connect时可能报非常参数错误
+    addr_len = SockUtil::get_sock_len(dst_addr);
     if (soft_bind) {
         // 软绑定，只保存地址  [AUTO-TRANSLATED:e74e9b53]
         //Soft bind, only save the address
@@ -963,7 +1025,7 @@ bool Socket::bindPeerAddr(const struct sockaddr *dst_addr, socklen_t addr_len, b
         //After hard binding, cancel soft binding to prevent performance loss of memcpy target address
         _udp_send_dst = nullptr;
         if (-1 == ::connect(_sock_fd->rawFd(), dst_addr, addr_len)) {
-            WarnL << "Connect socket to peer address failed: " << SockUtil::inet_ntoa(dst_addr);
+            WarnL << "Connect socket to peer address failed: " << SockUtil::inet_ntoa(dst_addr) << ", err: " << get_uv_errmsg();
             return false;
         }
         memcpy(&_peer_addr, dst_addr, addr_len);
@@ -973,6 +1035,25 @@ bool Socket::bindPeerAddr(const struct sockaddr *dst_addr, socklen_t addr_len, b
 
 void Socket::setSendFlags(int flags) {
     _sock_flags = flags;
+}
+
+bool Socket::setUdpRecvBuffer(const SocketRecvBuffer::Ptr &buffer) {
+    // This hook is setup-time only. UdpServer creation callbacks may run
+    // before the owner poller starts processing the fd, so the hard
+    // requirement here is "before fd creation/attach", not "already on
+    // poller thread". The customization itself is only honored for UDP
+    // sockets.
+    LOCK_GUARD(_mtx_sock_fd);
+    if (_sock_fd || _udp_recv_buffer_frozen) {
+        WarnL << "setUdpRecvBuffer must be called before the socket fd is created and UDP IO is attached";
+        return false;
+    }
+    _read_buffer = buffer;
+    return true;
+}
+
+void Socket::setIgnoreUdpConnRefused(bool ignore) {
+    _ignore_udp_conn_refused.store(ignore, std::memory_order_release);
 }
 
 ///////////////SockSender///////////////////
@@ -1043,6 +1124,13 @@ ssize_t SocketHelper::send(Buffer::Ptr buf) {
     return _sock->send(std::move(buf), nullptr, 0, _try_flush);
 }
 
+ssize_t SocketHelper::sendto(Buffer::Ptr buf, struct sockaddr *addr, socklen_t addr_len) {
+    if (!_sock) {
+        return -1;
+    }
+    return _sock->send(std::move(buf), addr, addr_len, _try_flush);
+}
+
 void SocketHelper::shutdown(const SockException &ex) {
     if (_sock) {
         _sock->emitErr(ex);
@@ -1072,6 +1160,14 @@ string SocketHelper::get_peer_ip() {
 
 uint16_t SocketHelper::get_peer_port() {
     return _sock ? _sock->get_peer_port() : 0;
+}
+
+const sockaddr * SocketHelper::get_peer_addr() {
+    return _sock ? _sock->get_peer_addr() : nullptr;
+}
+
+const sockaddr *SocketHelper::get_local_addr() {
+    return _sock ? _sock->get_local_addr() : nullptr;
 }
 
 bool SocketHelper::isSocketBusy() const {

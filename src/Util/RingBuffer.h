@@ -62,8 +62,9 @@ public:
     using Ptr = std::shared_ptr<_RingReader>;
     friend class _RingReaderDispatcher<T>;
 
-    _RingReader(std::shared_ptr<_RingStorage<T>> storage) {
+    _RingReader(std::shared_ptr<_RingStorage<T>> storage, size_t max_gop_size = SIZE_MAX) {
         _storage = std::move(storage);
+        _max_gop_size = max_gop_size;
         setReadCB(nullptr);
         setDetachCB(nullptr);
         setGetInfoCB(nullptr);
@@ -72,12 +73,20 @@ public:
 
     ~_RingReader() = default;
 
-    void setReadCB(std::function<void(const T &)> cb) {
+    void setReadCB2(std::function<void(const T &, bool)> cb) {
         if (!cb) {
-            _read_cb = [](const T &) {};
+            _read_cb = [](const T &, bool) {};
         } else {
             _read_cb = std::move(cb);
             flushGop();
+        }
+    }
+
+    void setReadCB(std::function<void(const T &)> cb) {
+        if (cb) {
+            setReadCB2([cb](const T &data, bool) { cb(data); });
+        } else {
+            setReadCB2(nullptr);
         }
     }
 
@@ -97,21 +106,28 @@ public:
         if (!_storage) {
             return;
         }
-        _storage->getCache().for_each([this](const List<std::pair<bool, T>> &lst) {
+        auto gop_count = _storage->getCache().size();
+        auto gop_erase = gop_count > _max_gop_size ? gop_count - _max_gop_size : 0U;
+        auto gop_index = 0U;
+        _storage->getCache().for_each([&](const List<std::pair<bool, T>> &lst) {
+            if (gop_index++ < gop_erase) {
+                return;
+            }
             lst.for_each([this](const std::pair<bool, T> &pr) { onRead(pr.second, pr.first); });
         });
     }
 
 private:
-    void onRead(const T &data, bool /*is_key*/) { _read_cb(data); }
+    void onRead(const T &data, bool is_key) { _read_cb(data, is_key); }
     void onMessage(const Any &data) { _msg_cb(data); }
     void onDetach() const { _detach_cb(); }
     Any getInfo() { return _info_cb(); }
 
 private:
+    size_t _max_gop_size;
     std::shared_ptr<_RingStorage<T>> _storage;
     std::function<void(void)> _detach_cb;
-    std::function<void(const T &)> _read_cb;
+    std::function<void(const T &, bool)> _read_cb;
     std::function<Any()> _info_cb;
     std::function<void(const Any &data)> _msg_cb;
 };
@@ -171,7 +187,7 @@ public:
         if (++_size > _max_size) {
             // GOP缓存溢出  [AUTO-TRANSLATED:1cd0ddc4]
             //GOP cache overflow
-            while (_data_cache.size() > 1) {
+            while ((_size > _max_size) && (_data_cache.size() > 1)) {
                 //先尝试清除老的GOP缓存  [AUTO-TRANSLATED:a01422a1]
                 //Try to clear the old GOP cache first
                 popFrontGop();
@@ -296,7 +312,7 @@ private:
         }
     }
 
-    std::shared_ptr<RingReader> attach(const EventPoller::Ptr &poller, bool use_cache) {
+    std::shared_ptr<RingReader> attach(const EventPoller::Ptr &poller, bool use_cache, size_t max_gop_size) {
         if (!poller->isCurrentThread()) {
             throw std::runtime_error("You can attach RingBuffer only in it's poller thread");
         }
@@ -313,7 +329,7 @@ private:
             });
         };
 
-        std::shared_ptr<RingReader> reader(new RingReader(use_cache ? _storage : nullptr), on_dealloc);
+        std::shared_ptr<RingReader> reader(new RingReader(use_cache ? _storage : nullptr, max_gop_size), on_dealloc);
         _reader_map[reader.get()] = reader;
         ++_reader_size;
         onSizeChanged(true);
@@ -399,7 +415,7 @@ public:
 
     void setDelegate(const typename RingDelegate<T>::Ptr &delegate) { _delegate = delegate; }
 
-    std::shared_ptr<RingReader> attach(const EventPoller::Ptr &poller, bool use_cache = true) {
+    std::shared_ptr<RingReader> attach(const EventPoller::Ptr &poller, bool use_cache = true, size_t max_gop_size = SIZE_MAX) {
         typename RingReaderDispatcher::Ptr dispatcher;
         {
             LOCK_GUARD(_mtx_map);
@@ -417,7 +433,7 @@ public:
             dispatcher = ref;
         }
 
-        return dispatcher->attach(poller, use_cache);
+        return dispatcher->attach(poller, use_cache, max_gop_size);
     }
 
     int readerCount() { return _total_count; }

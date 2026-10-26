@@ -45,7 +45,11 @@ namespace toolkit {
 
 //默认的socket flags:不触发SIGPIPE,非阻塞发送  [AUTO-TRANSLATED:fefc4946]
 //Default socket flags: do not trigger SIGPIPE, non-blocking send
-#define SOCKET_DEFAULE_FLAGS (FLAG_NOSIGNAL | FLAG_DONTWAIT )
+#define SOCKET_DEFAULT_FLAGS (FLAG_NOSIGNAL | FLAG_DONTWAIT )
+// Backward compatibility alias for the legacy misspelled macro name.
+#ifndef SOCKET_DEFAULE_FLAGS
+#define SOCKET_DEFAULE_FLAGS SOCKET_DEFAULT_FLAGS
+#endif
     
 //发送超时时间，如果在规定时间内一直没有发送数据成功，那么将触发onErr事件  [AUTO-TRANSLATED:9c5d8d87]
 //Send timeout time, if no data is sent successfully within the specified time, the onErr event will be triggered
@@ -193,9 +197,9 @@ public:
      
      * [AUTO-TRANSLATED:2eb468c4]
      */
-    SockFD(SockNum::Ptr num, const EventPoller::Ptr &poller) {
+    SockFD(SockNum::Ptr num, EventPoller::Ptr poller) {
         _num = std::move(num);
-        _poller = poller;
+        _poller = std::move(poller);
     }
 
     /**
@@ -208,9 +212,9 @@ public:
      
      * [AUTO-TRANSLATED:51fca132]
      */
-    SockFD(const SockFD &that, const EventPoller::Ptr &poller) {
+    SockFD(const SockFD &that, EventPoller::Ptr poller) {
         _num = that._num;
-        _poller = poller;
+        _poller = std::move(poller);
         if (_poller == that._poller) {
             throw std::invalid_argument("Copy a SockFD with same poller");
         }
@@ -412,7 +416,7 @@ public:
      * 从另外一个Socket克隆
      * 目的是一个socket可以被多个poller对象监听，提高性能或实现Socket归属线程的迁移
      * @param other 原始的socket对象
-     * @return 是否成功
+     * @return 是否成功, 析构后添加poller事件监听
      * Clone from another Socket
      * The purpose is to allow a socket to be listened to by multiple poller objects, improving performance or implementing socket migration between threads
      * @param other Original socket object
@@ -420,7 +424,13 @@ public:
      
      * [AUTO-TRANSLATED:b3669f71]
      */
-    bool cloneSocket(const Socket &other);
+    std::shared_ptr<void> cloneSocket(const Socket &other);
+
+    /**
+     * 切换poller线程，注意只能在onAccept之前调用
+     * @param poller 新线程
+     */
+    void moveTo(EventPoller::Ptr poller);
 
     ////////////设置事件回调////////////  [AUTO-TRANSLATED:0bfc62ce]
     //////////// Set event callbacks ////////////
@@ -643,7 +653,36 @@ public:
      
      * [AUTO-TRANSLATED:2b11445c]
      */
-    void setSendFlags(int flags = SOCKET_DEFAULE_FLAGS);
+    void setSendFlags(int flags = SOCKET_DEFAULT_FLAGS);
+
+    // Install a UDP-specific recv buffer before the socket starts receiving.
+    // This is intended for setup-time tuning, not runtime reconfiguration
+    // after IO callbacks are active.
+    /**
+     * Replace the UDP recv buffer before the socket fd is created/attached.
+     * This is intended for setup-time customization of special UDP transports
+     * and must not be used as a runtime reconfiguration hook.
+     *
+     * IMPORTANT: custom SocketRecvBuffer implementations must remain
+     * compatible with the batched UDP receive path used by Socket::onRead().
+     * For the active receive batch, both &buffer->getBuffer(0) and
+     * &buffer->getAddress(0) are treated as pointers to contiguous arrays
+     * that can be indexed up to count - 1, and the referenced storage must
+     * remain valid for the duration of the receive operation.
+     *
+     * Passing a SocketRecvBuffer that does not satisfy this layout/lifetime
+     * contract is unsupported and may lead to undefined behavior.
+     *
+     * @return Whether the configuration was accepted.
+     */
+    bool setUdpRecvBuffer(const SocketRecvBuffer::Ptr &buffer);
+
+    // Suppress the UDP ECONNREFUSED read warning on sockets that intentionally
+    // communicate with transient peers, such as QUIC sessions that may receive
+    // a late ICMP port-unreachable after the peer has already closed. This is
+    // a narrow transport-specific knob and should not be enabled casually by
+    // ordinary upper-layer business code.
+    void setIgnoreUdpConnRefused(bool ignore);
 
     /**
      * 关闭套接字
@@ -677,7 +716,7 @@ public:
      
      * [AUTO-TRANSLATED:5de8aa1c]
      */
-    int getRecvSpeed();
+    size_t getRecvSpeed();
 
     /**
      * 获取发送速率，单位bytes/s
@@ -685,7 +724,23 @@ public:
      
      * [AUTO-TRANSLATED:96a2595d]
      */
-    int getSendSpeed();
+    size_t getSendSpeed();
+
+    /**
+     * 获取接收总字节数
+     * Get the total recv bytes
+
+     * [AUTO-TRANSLATED:5de8aa1c]
+     */
+    size_t getRecvTotalBytes();
+
+    /**
+     * 获取发送总字节数
+     * Get the total send bytes
+
+     * [AUTO-TRANSLATED:5de8aa1c]
+     */
+    size_t getSendTotalBytes();
 
     ////////////SockInfo override////////////
     std::string get_local_ip() override;
@@ -693,6 +748,8 @@ public:
     std::string get_peer_ip() override;
     uint16_t get_peer_port() override;
     std::string getIdentifier() const override;
+    const sockaddr *get_peer_addr();
+    const sockaddr *get_local_addr();
 
 private:
     Socket(EventPoller::Ptr poller, bool enable_mutex = true);
@@ -710,11 +767,10 @@ private:
     ssize_t send_l(Buffer::Ptr buf, bool is_buf_sock, bool try_flush = true);
     void connect_l(const std::string &url, uint16_t port, const onErrCB &con_cb_in, float timeout_sec, const std::string &local_ip, uint16_t local_port);
     bool fromSock_l(SockNum::Ptr sock);
-
 private:
     // send socket时的flag  [AUTO-TRANSLATED:e364a1bf]
     //Flag for sending socket
-    int _sock_flags = SOCKET_DEFAULE_FLAGS;
+    int _sock_flags = SOCKET_DEFAULT_FLAGS;
     // 最大发送缓存，单位毫秒，距上次发送缓存清空时间不能超过该参数  [AUTO-TRANSLATED:3bd6dba3]
     //Maximum send buffer, in milliseconds, the time since the last send buffer was cleared cannot exceed this parameter
     uint32_t _max_send_buffer_ms = SEND_TIME_OUT_SEC * 1000;
@@ -799,6 +855,13 @@ private:
     //Object count statistics
     ObjectStatistic<Socket> _statistic;
 
+    // Optional per-socket recv path used by a small number of UDP transports.
+    // This must be configured before the socket fd is created or any IO
+    // callbacks are attached.
+    SocketRecvBuffer::Ptr _read_buffer;
+    bool _udp_recv_buffer_frozen = false;
+    std::atomic<bool> _ignore_udp_conn_refused{false};
+
     // 链接缓存地址,防止tcp reset 导致无法获取对端的地址  [AUTO-TRANSLATED:f8847463]
     //Connection cache address, to prevent TCP reset from causing the inability to obtain the peer's address
     struct sockaddr_storage _local_addr;
@@ -810,6 +873,7 @@ public:
     SockSender() = default;
     virtual ~SockSender() = default;
     virtual ssize_t send(Buffer::Ptr buf) = 0;
+    virtual ssize_t sendto(Buffer::Ptr buf, struct sockaddr *addr = nullptr, socklen_t addr_len = 0) = 0;
     virtual void shutdown(const SockException &ex = SockException(Err_shutdown, "self shutdown")) = 0;
 
     //发送char *  [AUTO-TRANSLATED:ab84aeb3]
@@ -930,6 +994,8 @@ public:
     uint16_t get_local_port() override;
     std::string get_peer_ip() override;
     uint16_t get_peer_port() override;
+    const sockaddr *get_peer_addr();
+    const sockaddr *get_local_addr();
 
     ///////////////////// TaskExecutorInterface override /////////////////////
     /**
@@ -962,6 +1028,11 @@ public:
      * [AUTO-TRANSLATED:6a7a5178]
      */
     ssize_t send(Buffer::Ptr buf) override;
+	
+    /**
+     * 统一发送数据的出口
+     */
+    ssize_t sendto(Buffer::Ptr buf, struct sockaddr *addr = nullptr, socklen_t addr_len = 0) override;
 
     /**
      * 触发onErr事件

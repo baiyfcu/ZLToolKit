@@ -116,7 +116,7 @@ class BufferRaw : public Buffer {
 public:
     using Ptr = std::shared_ptr<BufferRaw>;
 
-    static Ptr create();
+    static Ptr create(size_t size = 0);
 
     ~BufferRaw() override {
         if (_data) {
@@ -426,9 +426,25 @@ public:
     }
 
     void resize(size_t size, char c = '\0') {
-        _str.resize(size, c);
-        _erase_head = 0;
-        _erase_tail = 0;
+        auto old_size = this->size();
+        if (size == old_size) {
+            return;
+        }
+        if (size > old_size) {
+            auto append = size - old_size;
+            if (append > _erase_tail) {
+                _str.resize(append - _erase_tail, c);
+                memset(const_cast<char *>(_str.data()) + _erase_head + old_size, c, _erase_tail);
+                _erase_tail = 0;
+            } else {
+                _erase_tail -= append;
+                memset(const_cast<char *>(_str.data()) + _erase_head + old_size, c, append);
+            }
+        } else {
+            auto erased = old_size - size;
+            _erase_tail += erased;
+            memset(const_cast<char *>(_str.data()) + _erase_head + size, c, erased);
+        }
     }
 
     bool empty() const {
@@ -453,6 +469,11 @@ public:
         return _str.substr(_erase_head + pos, n);
     }
 
+protected:
+    size_t _erase_head;
+    size_t _erase_tail;
+    std::string _str;
+
 private:
     void moveData() {
         if (_erase_head) {
@@ -461,10 +482,6 @@ private:
         }
     }
 
-private:
-    size_t _erase_head;
-    size_t _erase_tail;
-    std::string _str;
     //对象个数统计  [AUTO-TRANSLATED:3b43e8c2]
     //Object count statistics
     ObjectStatistic<BufferLikeString> _statistic;

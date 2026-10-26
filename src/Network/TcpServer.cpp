@@ -27,6 +27,7 @@ TcpServer::TcpServer(const EventPoller::Ptr &poller) : Server(poller) {
 void TcpServer::setupEvent() {
     _socket = createSocket(_poller);
     weak_ptr<TcpServer> weak_self = std::static_pointer_cast<TcpServer>(shared_from_this());
+#if 1
     _socket->setOnBeforeAccept([weak_self](const EventPoller::Ptr &poller) -> Socket::Ptr {
         if (auto strong_self = weak_self.lock()) {
             return strong_self->onBeforeAcceptConnection(poller);
@@ -38,12 +39,28 @@ void TcpServer::setupEvent() {
             auto ptr = sock->getPoller().get();
             auto server = strong_self->getServer(ptr);
             ptr->async([server, sock, complete]() {
-                //该tcp客户端派发给对应线程的TcpServer服务器  [AUTO-TRANSLATED:662b882f]
-                //This TCP client is dispatched to the corresponding thread of the TcpServer server
+                // 该tcp客户端派发给对应线程的TcpServer服务器  [AUTO-TRANSLATED:662b882f]
+                // This TCP client is dispatched to the corresponding thread of the TcpServer server
                 server->onAcceptConnection(sock);
             });
         }
     });
+#else
+    _socket->setOnAccept([weak_self](Socket::Ptr &sock, shared_ptr<void> &complete) {
+        if (auto strong_self = weak_self.lock()) {
+            if (strong_self->_multi_poller) {
+                EventPollerPool::Instance().getExecutor([sock, complete, weak_self](const TaskExecutor::Ptr &exe) {
+                    if (auto strong_self = weak_self.lock()) {
+                        sock->moveTo(static_pointer_cast<EventPoller>(exe));
+                        strong_self->getServer(sock->getPoller().get())->onAcceptConnection(sock);
+                    }
+                });
+            } else {
+                strong_self->onAcceptConnection(sock);
+            }
+        }
+    });
+#endif
 }
 
 TcpServer::~TcpServer() {
@@ -74,7 +91,7 @@ void TcpServer::setOnCreateSocket(Socket::onCreateSocket cb) {
         };
     }
     for (auto &pr : _cloned_server) {
-        pr.second->setOnCreateSocket(cb);
+        pr.second->setOnCreateSocket(_on_create_socket);
     }
 }
 
@@ -97,6 +114,7 @@ void TcpServer::cloneFrom(const TcpServer &that) {
     _main_server = false;
     _on_create_socket = that._on_create_socket;
     _session_alloc = that._session_alloc;
+    _multi_poller = that._multi_poller;
     weak_ptr<TcpServer> weak_self = std::static_pointer_cast<TcpServer>(shared_from_this());
     _timer = std::make_shared<Timer>(2.0f, [weak_self]() -> bool {
         auto strong_self = weak_self.lock();
@@ -196,7 +214,7 @@ Session::Ptr TcpServer::onAcceptConnection(const Socket::Ptr &sock) {
     return session;
 }
 
-void TcpServer::start_l(uint16_t port, const std::string &host, uint32_t backlog) {
+void TcpServer::start_l(const std::string &type, uint16_t port, const std::string &host, uint32_t backlog) {
     setupEvent();
 
     //新建一个定时器定时管理这些tcp会话  [AUTO-TRANSLATED:ef859bd7]
@@ -239,7 +257,7 @@ void TcpServer::start_l(uint16_t port, const std::string &host, uint32_t backlog
         pr.second->_socket->cloneSocket(*_socket);
     }
 
-    InfoL << "TCP server listening on [" << host << "]: " << port;
+    InfoL << "TCP server[" << type << "] listening on [" << host << "]: " << port;
 }
 
 void TcpServer::onManagerSession() {

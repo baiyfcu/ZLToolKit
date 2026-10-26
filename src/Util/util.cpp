@@ -110,6 +110,52 @@ string makeRandStr(int sz, bool printable) {
     return ret;
 }
 
+uint64_t makeRandNum() {
+    // 生成一个 64 位的随机整数
+    std::random_device rd;
+    std::mt19937 mt(rd());
+    std::uniform_int_distribution<uint64_t> dist(0, UINT64_MAX);
+    uint64_t id = dist(mt);
+
+    return id;
+}
+
+string makeUuidStr() {
+    std::random_device rd;
+    std::mt19937 mt(rd());
+    std::uniform_int_distribution<uint64_t> dist(0, 15);
+    std::uniform_int_distribution<uint64_t> dist2(8, 11);
+    uint64_t id = dist(mt);
+
+    std::stringstream ret;
+    ret << std::hex;
+
+    for (int i = 0; i < 8; i++) {
+        ret << dist(mt);
+    }
+    ret << "-";
+
+    for (int i = 0; i < 4; i++) {
+        ret << dist(mt);
+    }
+    ret << "-4";  //版本4表示
+
+    for (int i = 0; i < 3; i++) {
+        ret << dist2(mt);
+    }
+    ret << "-";
+
+    for (int i = 0; i < 3; i++) {
+        ret << dist(mt);
+    }
+    ret << "-";
+
+    for (int i = 0; i < 12; i++) {
+        ret << dist(mt);
+    }
+    return ret.str();
+}
+
 bool is_safe(uint8_t b) {
     return b >= ' ' && b < 128;
 }
@@ -361,29 +407,22 @@ int vasprintf(char **strp, const char *fmt, va_list ap) {
 
 #endif //WIN32
 
-static long s_gmtoff = 0; //时间差
+//时区表在静态初始化阶段建好：此时尚未进入main()，通常只有一个线程，也早于任何fork()。
+//这是getGMTOff()/getLocalTime()唯一一次经过libc时区接口(它们会加锁)的地方，之后二者只查表，
+//不加锁、不调用libc，夏令时切换的那一刻也是如此。早于此处初始化的调用(其它编译单元的全局对象
+//构造期间)得到的是表里的UTC占位项
+//The timezone table is built during static initialization: main() has not been entered yet,
+//there is normally a single thread and no fork() has happened. This is the only place where
+//getGMTOff() and getLocalTime() go through the (locking) timezone interfaces of libc; afterwards
+//both only look the table up, without a lock and without calling into libc, at the very moment
+//of a daylight saving switch as well. A call made before this initialization (while global
+//objects of other translation units are being constructed) gets the UTC placeholder of the table
 static onceToken s_token([]() {
-#ifdef _WIN32
-    TIME_ZONE_INFORMATION tzinfo;
-    DWORD dwStandardDaylight;
-    long bias;
-    dwStandardDaylight = GetTimeZoneInformation(&tzinfo);
-    bias = tzinfo.Bias;
-    if (dwStandardDaylight == TIME_ZONE_ID_STANDARD) {
-        bias += tzinfo.StandardBias;
-    }
-    if (dwStandardDaylight == TIME_ZONE_ID_DAYLIGHT) {
-        bias += tzinfo.DaylightBias;
-    }
-    s_gmtoff = -bias * 60; //时间差(分钟)
-#else
     local_time_init();
-    s_gmtoff = getLocalTime(time(nullptr)).tm_gmtoff;
-#endif // _WIN32
 });
 
 long getGMTOff() {
-    return s_gmtoff;
+    return get_local_gmtoff(::time(nullptr));
 }
 
 static inline uint64_t getCurrentMicrosecondOrigin() {
@@ -402,13 +441,16 @@ static atomic<uint64_t> s_currentMicrosecond_system(getCurrentMicrosecondOrigin(
 static atomic<uint64_t> s_currentMillisecond_system(getCurrentMicrosecondOrigin() / 1000);
 
 static inline bool initMillisecondThread() {
-    static std::thread s_thread([]() {
+    auto running = std::make_shared<bool>(true);
+    auto lam = [running]() {
+        // 确该保线程退出前日志打印可用
+        auto logger = Logger::Instance().shared_from_this();
         setThreadName("stamp thread");
         DebugL << "Stamp thread started";
         uint64_t last = getCurrentMicrosecondOrigin();
         uint64_t now;
         uint64_t microsecond = 0;
-        while (true) {
+        while (*running) {
             now = getCurrentMicrosecondOrigin();
             //记录系统时间戳，可回退  [AUTO-TRANSLATED:495a0114]
             //Record system timestamp, can be rolled back
@@ -432,9 +474,11 @@ static inline bool initMillisecondThread() {
             //Sleep for 0.5 ms
             usleep(500);
         }
-    });
-    static onceToken s_token([]() {
-        s_thread.detach();
+    };
+    static std::shared_ptr<std::thread> s_thread(new std::thread(lam), [running](std::thread *t) {
+        *running = false;
+        t->join();
+        delete t;
     });
     return true;
 }
@@ -478,11 +522,7 @@ string getTimeStr(const char *fmt, time_t time) {
 
 struct tm getLocalTime(time_t sec) {
     struct tm tm;
-#ifdef _WIN32
-    localtime_s(&tm, &sec);
-#else
     no_locks_localtime(&tm, sec);
-#endif //_WIN32
     return tm;
 }
 

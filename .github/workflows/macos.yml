@@ -17,30 +17,37 @@ jobs:
     steps:
     - uses: actions/checkout@v2
 
-    - name: Create Build Environment
-      # Some projects don't allow in-source building, so create a separate build directory
-      # We'll use this as our working directory for all subsequent commands
-      run: cmake -E make_directory ${{github.workspace}}/build
+    - name: 配置 vcpkg
+      uses: lukka/run-vcpkg@v7
+      with:
+        vcpkgDirectory: '${{github.workspace}}/vcpkg'
+        vcpkgTriplet: arm64-osx
+        # 2025.07.11
+        vcpkgGitCommitId: 'efcfaaf60d7ec57a159fc3110403d939bfb69729'
+        vcpkgArguments: 'openssl'
 
-    - name: Configure CMake
-      # Use a bash shell so we can use the same syntax for environment variable
-      # access regardless of the host operating system
-      shell: bash
-      working-directory: ${{github.workspace}}/build
-      # Note the current convention is to use the -S and -B options here to specify source 
-      # and build directories, but this is only available with CMake 3.13 and higher.  
-      # The CMake binaries on the Github Actions machines are (as of this writing) 3.12
-      run: cmake $GITHUB_WORKSPACE -DCMAKE_BUILD_TYPE=$BUILD_TYPE
+    - name: 安装指定 CMake
+      uses: jwlawson/actions-setup-cmake@v2
+      with:
+        cmake-version: '3.30.5'
 
-    - name: Build
-      working-directory: ${{github.workspace}}/build
-      shell: bash
-      # Execute the build.  You can specify a specific target with "--target <NAME>"
-      run: cmake --build . --config $BUILD_TYPE -j $(nproc)
+    - name: 编译
+      uses: lukka/run-cmake@v3
+      with:
+        useVcpkgToolchainFile: true
+        buildDirectory: '${{github.workspace}}/build'
+        cmakeAppendedArgs: ''
+        cmakeBuildType: 'RelWithDebInfo'
 
-    - name: Test
-      working-directory: ${{github.workspace}}/build
-      shell: bash
-      # Execute tests defined by the CMake configuration.  
-      # See https://cmake.org/cmake/help/latest/manual/ctest.1.html for more detail
-      run: ctest -C $BUILD_TYPE
+    - name: 执行门禁用例
+      working-directory: '${{github.workspace}}/build'
+      # 门禁用例见 tests/CMakeLists.txt 的 GATING_TESTS，失败则中断流水线。
+      # --no-tests=error 不可省略：一个用例都没注册时 ctest 默认返回成功，门禁会悄悄失效。
+      # 当前生成器为单配置，-C 实际不起作用，保留是为了将来换成多配置生成器时仍然正确，
+      # 其取值需与上面的 cmakeBuildType 保持一致
+      # Gating cases are listed in GATING_TESTS in tests/CMakeLists.txt, a failure breaks the
+      # pipeline. --no-tests=error is required: with no test registered ctest succeeds by default
+      # and the gate would silently stop guarding anything. The generator in use is single-config
+      # so -C has no effect today; it is kept so that switching to a multi-config generator keeps
+      # working, and its value has to match the cmakeBuildType above
+      run: ctest -C RelWithDebInfo --output-on-failure --no-tests=error

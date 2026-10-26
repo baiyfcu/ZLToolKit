@@ -116,8 +116,7 @@ FILE *File::create_file(const std::string &file, const std::string &mode) {
         }
         if (_access(dir.data(), 0) == -1) { //access函数是查看是不是存在
             if (mkdir(dir.data(), 0777) == -1) {  //如果不存在就用mkdir函数来创建
-                WarnL << "mkdir " << dir << " failed: " << get_uv_errmsg();
-                return nullptr;
+                TraceL << "mkdir " << dir << " failed: " << get_uv_errmsg();
             }
         }
     }
@@ -336,7 +335,7 @@ void File::scanDir(const std::string &path_in, const function<bool(const string 
         if (isDir && enter_subdirectory) {
             //如果是文件夹并且扫描子文件夹，那么递归扫描  [AUTO-TRANSLATED:36773722]
             //If it's a folder and scanning subfolders, then recursively scan
-            scanDir(strAbsolutePath, cb, enter_subdirectory);
+            scanDir(strAbsolutePath, cb, enter_subdirectory, show_hidden_file);
         }
     }
     closedir(pDir);
